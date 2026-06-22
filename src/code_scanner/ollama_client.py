@@ -9,7 +9,7 @@ import urllib.request
 from typing import Any, Optional
 
 from .base_client import BaseLLMClient, LLMClientError, ContextOverflowError, RequestBuilder
-from .models import LLMConfig
+from .models import LLMConfig, LLMToolCallResponse
 from .error_messages import OllamaErrors, GeneralErrors
 
 logger = logging.getLogger(__name__)
@@ -272,7 +272,9 @@ class OllamaClient(BaseLLMClient):
                             "arguments": tool_call["function"]["arguments"],
                         })
                     logger.info(f"Ollama requested {len(tool_calls)} tool call(s)")
-                    return {"tool_calls": tool_calls}
+                    # Validate through Pydantic model
+                    validated = LLMToolCallResponse.model_validate({"tool_calls": tool_calls})
+                    return validated.model_dump()
 
                 content = message.get("content", "")
                 if not content:

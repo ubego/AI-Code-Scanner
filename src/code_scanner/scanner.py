@@ -12,7 +12,11 @@ from .file_filter import FileFilter
 from .git_watcher import GitWatcher
 from .issue_tracker import IssueTracker
 from .base_client import BaseLLMClient, LLMClientError, ContextOverflowError, SYSTEM_PROMPT_TEMPLATE, build_user_prompt
-from .models import Issue, GitState, ChangedFile, CheckGroup, ScanStatus, Project
+from .models import (
+    Issue, GitState, ChangedFile, CheckGroup, ScanStatus, Project,
+    LLMScanResponse, LLMToolCallResponse, LLMToolResult,
+    sanitize_llm_response,
+)
 from .output import OutputGenerator
 from .utils import (
     estimate_tokens,
@@ -888,7 +892,8 @@ class Scanner:
     ) -> list[Issue]:
         """Parse issues from LLM response.
 
-        Validates that file paths exist before including issues.
+        Validates the response through ``LLMScanResponse`` Pydantic model,
+        then checks that file paths exist before including issues.
         Issues with non-existent file paths are logged and skipped.
 
         Args:
@@ -899,18 +904,21 @@ class Scanner:
         Returns:
             List of parsed issues.
         """
+        # Sanitize then validate the full response through Pydantic
+        try:
+            sanitized_response = sanitize_llm_response(response)
+            validated = LLMScanResponse.model_validate(sanitized_response)
+        except Exception as e:
+            logger.warning(f"LLM response validation failed: {e}")
+            return []
+
         parsed_issues: list[Issue] = []
         skipped_count = 0
 
-        issues_data = response.get("issues", [])
-        if not isinstance(issues_data, list):
-            logger.warning(f"Issues field is not a list: {type(issues_data)}")
-            return []
-
-        for issue_data in issues_data:
+        for llm_issue in validated.issues:
             try:
                 issue = Issue.from_llm_response(
-                    data=issue_data,
+                    data=llm_issue,
                     check_query=check_query,
                     timestamp=datetime.now(timezone.utc),
                 )
@@ -936,7 +944,7 @@ class Scanner:
                 parsed_issues.append(issue)
                 logger.debug(f"Parsed issue: {issue.file_path}:{issue.line_number}")
             except Exception as e:
-                logger.warning(f"Failed to parse issue: {e}, data: {issue_data}")
+                logger.warning(f"Failed to parse issue: {e}, data: {llm_issue}")
 
         if skipped_count > 0:
             logger.info(f"Skipped {skipped_count} issue(s) with invalid or non-existent file paths")
@@ -1058,8 +1066,9 @@ class Scanner:
                 )
 
                 # Check if LLM wants to use tools
-                if "tool_calls" in response:
-                    tool_calls = response["tool_calls"]
+                if LLMToolCallResponse.is_tool_call(response):
+                    validated_tc = LLMToolCallResponse.model_validate(response)
+                    tool_calls = [tc.model_dump() for tc in validated_tc.tool_calls]
                     tool_names = [tc["tool_name"] for tc in tool_calls]
                     logger.info(f"LLM requested {len(tool_calls)} tool call(s): {', '.join(tool_names)} (iteration {iteration})")
 
@@ -1076,17 +1085,33 @@ class Scanner:
                         logger.debug(f"Executing tool: {tool_name} with args: {arguments}")
                         result = self.tool_executor.execute_tool(tool_name, arguments)
 
+                        # Validate tool result through Pydantic before sending to LLM
+                        try:
+                            validated_result = LLMToolResult(
+                                success=result.success,
+                                data=result.data,
+                                error=result.error,
+                                warning=result.warning,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Tool result validation failed for {tool_name}: {e}")
+                            validated_result = LLMToolResult(
+                                success=False,
+                                data=None,
+                                error=f"Tool result validation error: {e}",
+                            )
+
                         # Format tool result for LLM
-                        if result.success:
+                        if validated_result.success:
                             result_msg = f"Tool {tool_name} succeeded:\n{self._format_tool_result(result)}"
-                            if result.warning:
-                                logger.info(f"  ✓ {tool_name} completed with warning: {result.warning[:100]}...")
-                                result_msg = f"{result.warning}\n\n{result_msg}"
+                            if validated_result.warning:
+                                logger.info(f"  ✓ {tool_name} completed with warning: {validated_result.warning[:100]}...")
+                                result_msg = f"{validated_result.warning}\n\n{result_msg}"
                             else:
                                 logger.info(f"  ✓ {tool_name} completed successfully")
                         else:
-                            logger.info(f"  ✗ {tool_name} failed: {result.error}")
-                            result_msg = f"Tool {tool_name} failed: {result.error}"
+                            logger.info(f"  ✗ {tool_name} failed: {validated_result.error}")
+                            result_msg = f"Tool {tool_name} failed: {validated_result.error}"
 
                         tool_results.append(result_msg)
 
@@ -1122,7 +1147,7 @@ class Scanner:
                         })
 
                 # Check if LLM provided final answer (no more tool calls)
-                if "tool_calls" not in response:
+                if not LLMToolCallResponse.is_tool_call(response):
                     # LLM provided final answer
                     logger.debug(f"LLM provided final answer (iteration {iteration})")
                     break  # Exit tool calling loop

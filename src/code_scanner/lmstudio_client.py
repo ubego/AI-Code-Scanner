@@ -9,7 +9,7 @@ from typing import Any, Optional
 from openai import OpenAI, APIConnectionError, APIError
 
 from .base_client import BaseLLMClient, LLMClientError, ContextOverflowError, RequestBuilder
-from .models import LLMConfig
+from .models import LLMConfig, LLMToolCallResponse
 
 logger = logging.getLogger(__name__)
 
@@ -262,7 +262,9 @@ class LMStudioClient(BaseLLMClient):
                             "arguments": json.loads(tool_call.function.arguments),
                         })
                     logger.info(f"LLM requested {len(tool_calls)} tool call(s)")
-                    return {"tool_calls": tool_calls}
+                    # Validate through Pydantic model
+                    validated = LLMToolCallResponse.model_validate({"tool_calls": tool_calls})
+                    return validated.model_dump()
 
                 content = response.choices[0].message.content
                 if not content:
