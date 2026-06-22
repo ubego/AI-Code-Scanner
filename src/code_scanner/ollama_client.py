@@ -10,6 +10,11 @@ from typing import Any, Optional
 
 from .base_client import BaseLLMClient, LLMClientError, ContextOverflowError, RequestBuilder
 from .models import LLMConfig, LLMToolCallResponse
+from .stream_validator import (
+    StreamValidator,
+    RunawayGenerationError,
+    ResponseSizeExceededError,
+)
 from .error_messages import OllamaErrors, GeneralErrors
 
 logger = logging.getLogger(__name__)
@@ -250,6 +255,7 @@ class OllamaClient(BaseLLMClient):
                     tools=tools,
                     context_limit=self._context_limit,
                 )
+                request_data["stream"] = True
 
                 url = f"{self.config.base_url}/api/chat"
                 req = urllib.request.Request(
@@ -259,24 +265,49 @@ class OllamaClient(BaseLLMClient):
                     method="POST"
                 )
 
-                with urllib.request.urlopen(req, timeout=self.config.timeout) as response:
-                    data = json.loads(response.read().decode())
+                validator = StreamValidator()
+                accumulated_content_parts: list[str] = []
+                tool_calls_raw: list[dict] = []
+                final_message: dict = {}
 
-                # Check if Ollama wants to call tools
-                message = data.get("message", {})
-                if tools and message.get("tool_calls"):
-                    tool_calls = []
-                    for tool_call in message["tool_calls"]:
-                        tool_calls.append({
-                            "tool_name": tool_call["function"]["name"],
-                            "arguments": tool_call["function"]["arguments"],
-                        })
-                    logger.info(f"Ollama requested {len(tool_calls)} tool call(s)")
-                    # Validate through Pydantic model
-                    validated = LLMToolCallResponse.model_validate({"tool_calls": tool_calls})
+                with urllib.request.urlopen(req, timeout=self.config.timeout) as response:
+                    for line_bytes in response:
+                        line = line_bytes.decode("utf-8").strip()
+                        if not line:
+                            continue
+                        try:
+                            chunk_data = json.loads(line)
+                        except json.JSONDecodeError:
+                            logger.debug("Skipping unparseable streaming chunk: %s", line[:100])
+                            continue
+
+                        message = chunk_data.get("message", {})
+                        content_delta = message.get("content", "")
+                        if content_delta:
+                            accumulated_content_parts.append(content_delta)
+                            validator.feed(content_delta)
+                        else:
+                            validator.feed("")
+
+                        if chunk_data.get("done"):
+                            final_message = message
+                            if tools and message.get("tool_calls"):
+                                for tc in message["tool_calls"]:
+                                    tool_calls_raw.append({
+                                        "tool_name": tc["function"]["name"],
+                                        "arguments": tc["function"]["arguments"],
+                                    })
+                            break
+
+                if tools and tool_calls_raw:
+                    logger.info(f"Ollama requested {len(tool_calls_raw)} tool call(s)")
+                    validated = LLMToolCallResponse.model_validate({"tool_calls": tool_calls_raw})
                     return validated.model_dump()
 
-                content = message.get("content", "")
+                content = "".join(accumulated_content_parts)
+                if not content:
+                    # Some Ollama models put final content only in the "done" chunk
+                    content = final_message.get("content", "")
                 if not content:
                     logger.warning(
                         f"Empty response from Ollama (attempt {attempt + 1}/{max_retries}). "
@@ -332,6 +363,13 @@ class OllamaClient(BaseLLMClient):
                     )
                 
                 logger.warning(f"Ollama HTTP error (attempt {attempt + 1}): {e}")
+                continue
+
+            except (RunawayGenerationError, ResponseSizeExceededError) as e:
+                logger.warning(
+                    f"Ollama response issue (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+                last_raw_response = str(e)[:1000]
                 continue
 
             except urllib.error.URLError as e:
@@ -453,23 +491,29 @@ class OllamaClient(BaseLLMClient):
 
         return content
 
-    def wait_for_connection(self, retry_interval: int = 10) -> None:
+    def wait_for_connection(self, retry_interval: int = 10, max_attempts: int = 0) -> None:
         """Wait for Ollama to become available.
 
         Retries connection every `retry_interval` seconds until successful.
+        If `max_attempts` is > 0, stops after that many attempts.
 
         Args:
             retry_interval: Seconds between retry attempts.
+            max_attempts: Maximum connection attempts (0 = unlimited).
         """
         logger.info("Waiting for Ollama connection...")
+        attempt = 0
 
         while True:
+            attempt += 1
             try:
                 self.connect()
                 logger.info("Ollama connection restored")
                 return
             except LLMClientError as e:
-                logger.warning(f"Connection failed: {e}")
+                logger.warning(f"Connection failed (attempt {attempt}): {e}")
+                if 0 < max_attempts <= attempt:
+                    raise
                 logger.info(f"Retrying in {retry_interval} seconds...")
                 time.sleep(retry_interval)
 

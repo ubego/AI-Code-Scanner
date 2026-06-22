@@ -10,6 +10,11 @@ from openai import OpenAI, APIConnectionError, APIError
 
 from .base_client import BaseLLMClient, LLMClientError, ContextOverflowError, RequestBuilder
 from .models import LLMConfig, LLMToolCallResponse
+from .stream_validator import (
+    StreamValidator,
+    RunawayGenerationError,
+    ResponseSizeExceededError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -245,28 +250,59 @@ class LMStudioClient(BaseLLMClient):
                     reasoning_effort="high",
                     response_format=response_format,
                 )
+                request_params["stream"] = True
 
-                response = self._client.chat.completions.create(**request_params)
+                stream = self._client.chat.completions.create(**request_params)
 
-                # Validate response structure
-                if not response.choices:
-                    logger.warning(f"Empty choices in LLM response (attempt {attempt + 1}/{max_retries}). Will retry.")
-                    continue
+                validator = StreamValidator()
+                accumulated_content_parts: list[str] = []
+                tool_call_buffers: dict[int, dict] = {}
 
-                # Check if LLM wants to call tools
-                if tools and response.choices[0].message.tool_calls:
+                for chunk in stream:
+                    if not chunk.choices:
+                        continue
+
+                    delta = chunk.choices[0].delta
+
+                    if delta.content:
+                        accumulated_content_parts.append(delta.content)
+                        validator.feed(delta.content)
+                    else:
+                        validator.feed("")
+
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in tool_call_buffers:
+                                tool_call_buffers[idx] = {"tool_name": "", "arguments": ""}
+                            buf = tool_call_buffers[idx]
+                            if tc_delta.id:
+                                buf["id"] = tc_delta.id
+                            if tc_delta.function and tc_delta.function.name:
+                                buf["tool_name"] = tc_delta.function.name
+                            if tc_delta.function and tc_delta.function.arguments:
+                                buf["arguments"] += tc_delta.function.arguments
+
+                    if chunk.choices[0].finish_reason is not None:
+                        break
+
+                if tool_call_buffers:
                     tool_calls = []
-                    for tool_call in response.choices[0].message.tool_calls:
+                    for idx in sorted(tool_call_buffers.keys()):
+                        buf = tool_call_buffers[idx]
+                        try:
+                            args = json.loads(buf["arguments"]) if buf["arguments"] else {}
+                        except json.JSONDecodeError:
+                            args = {}
                         tool_calls.append({
-                            "tool_name": tool_call.function.name,
-                            "arguments": json.loads(tool_call.function.arguments),
+                            "tool_name": buf["tool_name"],
+                            "arguments": args,
                         })
                     logger.info(f"LLM requested {len(tool_calls)} tool call(s)")
-                    # Validate through Pydantic model
                     validated = LLMToolCallResponse.model_validate({"tool_calls": tool_calls})
                     return validated.model_dump()
 
-                content = response.choices[0].message.content
+                content = "".join(accumulated_content_parts)
                 if not content:
                     logger.warning(f"Empty response from LLM (attempt {attempt + 1}/{max_retries}). Will retry automatically.")
                     continue
@@ -298,6 +334,13 @@ class LMStudioClient(BaseLLMClient):
                     
                     # If fix failed, continue to next retry attempt
                     continue
+
+            except (RunawayGenerationError, ResponseSizeExceededError) as e:
+                logger.warning(
+                    f"LM Studio response issue (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+                last_raw_response = str(e)[:1000]
+                continue
 
             except APIConnectionError as e:
                 # Connection lost mid-session - this needs special handling
@@ -434,23 +477,29 @@ class LMStudioClient(BaseLLMClient):
 
         return content
 
-    def wait_for_connection(self, retry_interval: int = 10) -> None:
+    def wait_for_connection(self, retry_interval: int = 10, max_attempts: int = 0) -> None:
         """Wait for LM Studio to become available.
 
         Retries connection every `retry_interval` seconds until successful.
+        If `max_attempts` is > 0, stops after that many attempts.
 
         Args:
             retry_interval: Seconds between retry attempts.
+            max_attempts: Maximum connection attempts (0 = unlimited).
         """
         logger.info("Waiting for LM Studio connection...")
+        attempt = 0
 
         while True:
+            attempt += 1
             try:
                 self.connect()
                 logger.info("LM Studio connection restored")
                 return
             except LLMClientError as e:
-                logger.warning(f"Connection failed: {e}")
+                logger.warning(f"Connection failed (attempt {attempt}): {e}")
+                if 0 < max_attempts <= attempt:
+                    raise
                 logger.info(f"Retrying in {retry_interval} seconds...")
                 time.sleep(retry_interval)
 

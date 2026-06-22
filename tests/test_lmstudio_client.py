@@ -12,6 +12,32 @@ from code_scanner.lmstudio_client import LMStudioClient, LLMClientError, Context
 from code_scanner.models import LLMConfig
 
 
+def _make_stream_chunk(content: str = "", finish_reason: str = None, tool_calls: list = None) -> MagicMock:
+    """Build a single streaming chunk MagicMock for LM Studio (OpenAI SDK)."""
+    delta = MagicMock()
+    delta.content = content
+    delta.tool_calls = tool_calls or []
+
+    choice = MagicMock()
+    choice.delta = delta
+    choice.finish_reason = finish_reason
+
+    chunk = MagicMock()
+    chunk.choices = [choice]
+    return chunk
+
+
+def _make_lmstudio_stream_response(content: str) -> list[MagicMock]:
+    """Build a list of streaming chunks that accumulate to the given content."""
+    chunks: list[MagicMock] = []
+    chunk_size = max(1, len(content) // 4) if content else 10
+    for i in range(0, len(content), chunk_size):
+        piece = content[i:i + chunk_size]
+        chunks.append(_make_stream_chunk(content=piece))
+    chunks.append(_make_stream_chunk(content="", finish_reason="stop"))
+    return chunks
+
+
 class TestLMStudioClient:
     """Tests for LMStudioClient class."""
 
@@ -75,8 +101,7 @@ class TestLMStudioClient:
         mock_client = MagicMock()
         mock_openai.return_value = mock_client
         mock_client.models.list.return_value = MagicMock(data=[MagicMock(id="qwen-coder")])
-        
-        # Mock response
+
         response_content = json.dumps({
             "issues": [
                 {
@@ -88,19 +113,14 @@ class TestLMStudioClient:
                 }
             ]
         })
-        mock_message = MagicMock()
-        mock_message.content = response_content
-        mock_choice = MagicMock()
-        mock_choice.message = mock_message
-        mock_response = MagicMock()
-        mock_response.choices = [mock_choice]
-        mock_client.chat.completions.create.return_value = mock_response
-        
+        stream_chunks = _make_lmstudio_stream_response(response_content)
+        mock_client.chat.completions.create.return_value = iter(stream_chunks)
+
         client = LMStudioClient(llm_config)
         client.connect()
-        
+
         result = client.query("Test prompt", "Code context")
-        
+
         assert "issues" in result
         assert len(result["issues"]) == 1
         assert result["issues"][0]["file"] == "test.cpp"
