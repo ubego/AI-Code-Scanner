@@ -180,7 +180,7 @@ class Application:
             for project in all_projects:
                 if project.project_id != active_project.project_id:
                     # Determine appropriate status based on changes
-                    state = project.git_watcher.get_state()
+                    state = project.git_watcher.get_state(log_conflict=False, project_name=project.project_id)
                     if state.has_changes:
                         project.scan_status = ScanStatus.WAITING_OTHER_PROJECT
                         logger.info(

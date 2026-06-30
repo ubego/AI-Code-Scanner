@@ -15,9 +15,9 @@ from .text_utils import similarity_ratio as _similarity_ratio
 
 logger = logging.getLogger(__name__)
 
-_MAX_STRING_LENGTH = 8192
-_MAX_FILE_PATH_LENGTH = 1024
-_MAX_CODE_SNIPPET_LENGTH = 16384
+_MAX_STRING_LENGTH = 8192       # ~1000-2000 words; enough for descriptions/fixes, prevents LLM context bombs
+_MAX_FILE_PATH_LENGTH = 1024    # Covers all real paths (most <256); POSIX PATH_MAX is 4096
+_MAX_CODE_SNIPPET_LENGTH = 16384  # ~400 lines of code for issue context; 2x general string limit
 _NONPRINTABLE_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 

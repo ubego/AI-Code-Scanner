@@ -82,36 +82,59 @@ class TestGitWatcherGetState:
         assert "Not connected" in str(exc_info.value)
 
     def test_get_state_rebase_head_detected(self, temp_git_repo):
-        """Test get_state detects REBASE_HEAD."""
+        """Test get_state detects REBASE_HEAD when unmerged entries exist."""
+        self._create_conflict(temp_git_repo, "coverage_rebase.txt", merge=False)
+
         watcher = GitWatcher(temp_git_repo)
         watcher.connect()
-        
-        # Create REBASE_HEAD to simulate rebase
-        rebase_head = temp_git_repo / ".git" / "REBASE_HEAD"
-        rebase_head.write_text("abc123")
-        
+
         state = watcher.get_state()
-        
+
         assert state.is_rebasing
-        
-        # Cleanup
-        rebase_head.unlink()
 
     def test_get_state_rebase_apply_detected(self, temp_git_repo):
-        """Test get_state detects rebase-apply directory."""
+        """Test get_state detects rebase-apply directory when unmerged entries exist."""
+        import subprocess
+
+        # Create rebase-apply directory AND unmerged entries via real rebase conflict
+        self._create_conflict(temp_git_repo, "coverage_rebase_apply.txt", merge=False)
+
         watcher = GitWatcher(temp_git_repo)
         watcher.connect()
-        
-        # Create rebase-apply directory
-        rebase_dir = temp_git_repo / ".git" / "rebase-apply"
-        rebase_dir.mkdir()
-        
+
         state = watcher.get_state()
-        
+
         assert state.is_rebasing
-        
-        # Cleanup
-        rebase_dir.rmdir()
+
+    @staticmethod
+    def _create_conflict(repo: Path, filename: str, merge: bool) -> None:
+        """Create a real merge/rebase conflict with unmerged entries."""
+        import subprocess
+
+        def run(cmd, **kw):
+            return subprocess.run(cmd, cwd=repo, capture_output=True, **kw)
+
+        result = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True)
+        base_branch = result.stdout.strip()
+
+        (repo / filename).write_text("version 1\n")
+        run(["git", "add", filename])
+        run(["git", "commit", "-m", "base commit for conflict"])
+
+        run(["git", "checkout", "-b", "conflict_side"])
+        (repo / filename).write_text("version 2\n")
+        run(["git", "add", filename])
+        run(["git", "commit", "-m", "side commit"])
+
+        run(["git", "checkout", base_branch])
+        (repo / filename).write_text("version 3\n")
+        run(["git", "add", filename])
+        run(["git", "commit", "-m", "main commit"])
+
+        if merge:
+            run(["git", "merge", "conflict_side"])
+        else:
+            run(["git", "rebase", "conflict_side"])
 
     def test_get_state_handles_detached_head(self, temp_git_repo):
         """Test get_state handles detached HEAD state."""
@@ -517,18 +540,34 @@ class TestGitWatcherUnmergedFiles:
     """Tests for handling unmerged files."""
 
     def test_handles_unmerged_files_during_merge_conflict(self, temp_git_repo):
-        """Test handling of unmerged files - merge conflicts are detected via state flags."""
+        """Test handling of unmerged files — merge conflicts detected via state flags."""
+        import subprocess
+
+        def run(cmd, **kw):
+            return subprocess.run(cmd, cwd=temp_git_repo, capture_output=True, **kw)
+
+        result = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True)
+        base_branch = result.stdout.strip()
+
+        (temp_git_repo / "conflict.txt").write_text("version 1\n")
+        run(["git", "add", "conflict.txt"])
+        run(["git", "commit", "-m", "base"])
+
+        run(["git", "checkout", "-b", "side"])
+        (temp_git_repo / "conflict.txt").write_text("version 2\n")
+        run(["git", "add", "conflict.txt"])
+        run(["git", "commit", "-m", "side commit"])
+
+        run(["git", "checkout", base_branch])
+        (temp_git_repo / "conflict.txt").write_text("version 3\n")
+        run(["git", "add", "conflict.txt"])
+        run(["git", "commit", "-m", "main commit"])
+
+        run(["git", "merge", "side"])
+
         watcher = GitWatcher(temp_git_repo)
         watcher.connect()
-        
-        # Create MERGE_HEAD to simulate merge in progress
-        merge_head = temp_git_repo / ".git" / "MERGE_HEAD"
-        merge_head.write_text("abc123")
-        
+
         state = watcher.get_state()
-        
-        # Should detect merge in progress
+
         assert state.is_merging
-        
-        # Cleanup
-        merge_head.unlink()

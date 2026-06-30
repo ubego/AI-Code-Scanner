@@ -90,6 +90,13 @@ class ProjectManager:
             self._projects[project_id] = project
         return project
     
+    @staticmethod
+    def _ns_to_datetime(ns: float) -> str:
+        if ns == 0.0:
+            return "N/A"
+        dt = datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
     def determine_active_project(self) -> Optional[Project]:
         """Determine which project should be active based on most recent changes.
         
@@ -98,8 +105,6 @@ class ProjectManager:
         Returns:
             The project that should be active, or None if no projects exist.
         """
-        from datetime import datetime, timezone
-
         with self._lock:
             if not self._projects:
                 return None
@@ -108,15 +113,18 @@ class ProjectManager:
                 logger.debug(f"Only one project, returning: {list(self._projects.keys())[0]}")
                 return next(iter(self._projects.values()))
 
-            # Get git state for all projects
+            # Get git state for all projects (suppress merge/rebase logging)
             project_activity: dict[str, float] = {}
             for project_id, project in self._projects.items():
                 if project.git_watcher is None:
                     logger.debug(f"Project {project_id} has no git watcher, skipping")
                     continue
 
-                state = project.git_watcher.get_state()
-                logger.debug(f"Project {project_id}: has_changes={state.has_changes}, changed_files={len(state.changed_files)}")
+                state = project.git_watcher.get_state(log_conflict=False, project_name=project_id)
+                logger.debug(f"Project {project_id}: has_changes={state.has_changes}, is_merging={state.is_merging}, is_rebasing={state.is_rebasing}, changed_files={len(state.changed_files)}")
+                if state.is_conflict_resolution_in_progress:
+                    logger.debug(f"Project {project_id}: in merge/rebase, skipping")
+                    continue
                 if state.has_changes:
                     # Find max mtime among changed files
                     max_mtime = max(
@@ -124,7 +132,7 @@ class ProjectManager:
                         default=0.0
                     )
                     project_activity[project_id] = max_mtime
-                    logger.debug(f"Project {project_id}: max_mtime_ns={max_mtime}, changed_files_with_mtime={sum(1 for f in state.changed_files if f.mtime_ns is not None)}")
+                    logger.debug(f"Project {project_id}: max_mtime={self._ns_to_datetime(max_mtime)}, changed_files_with_mtime={sum(1 for f in state.changed_files if f.mtime_ns is not None)}")
 
             # Find project with highest activity, filtering out already-scanned projects
             if not project_activity:
@@ -140,7 +148,10 @@ class ProjectManager:
                     logger.debug(f"Project {project_id} has no git watcher, skipping")
                     continue
 
-                state = project.git_watcher.get_state()
+                state = project.git_watcher.get_state(log_conflict=False, project_name=project_id)
+                if state.is_conflict_resolution_in_progress:
+                    logger.debug(f"Project {project_id}: in merge/rebase, skipping")
+                    continue
                 if state.has_changes:
                     # Check if this project has new changes since last scan
                     if project.last_scan_time is not None:
@@ -161,7 +172,7 @@ class ProjectManager:
                         )
                         project_activity[project_id] = max_mtime
                         eligible_projects.append(project_id)
-                        logger.debug(f"Project {project_id}: max_mtime_ns={max_mtime}, eligible (has new changes since last scan)")
+                        logger.debug(f"Project {project_id}: max_mtime={self._ns_to_datetime(max_mtime)}, eligible (has new changes since last scan)")
                     else:
                         logger.debug(f"Project {project_id}: no changes or already scanned, not eligible")
 
@@ -171,8 +182,9 @@ class ProjectManager:
                 return self.get_active_project()
 
             most_active_id = max(eligible_projects, key=project_activity.get)
-            logger.info(f"Project activity comparison (filtered): {project_activity}")
-            logger.info(f"Selected most active project: {most_active_id} (max_mtime_ns={project_activity[most_active_id]})")
+            readable_activity = {pid: self._ns_to_datetime(ts) for pid, ts in project_activity.items()}
+            logger.info(f"Project activity comparison (filtered): {readable_activity}")
+            logger.info(f"Selected most active project: {most_active_id} (mtime={self._ns_to_datetime(project_activity[most_active_id])})")
             return self._projects[most_active_id]
     
     def switch_to_project(self, project: Project, skip_cooldown: bool = False) -> None:
@@ -212,7 +224,7 @@ class ProjectManager:
                 new_status = ScanStatus.WAITING_NO_CHANGES
                 
                 if previous_project.git_watcher:
-                    state = previous_project.git_watcher.get_state()
+                    state = previous_project.git_watcher.get_state(log_conflict=False, project_name=previous_project.project_id)
                     if state.has_changes:
                         new_status = ScanStatus.WAITING_OTHER_PROJECT
                 

@@ -230,29 +230,91 @@ class TestGitWatcher:
 
     def test_merge_in_progress_detected(self, git_repo: Path):
         """Test that merge in progress is detected."""
-        # Create MERGE_HEAD to simulate merge
-        merge_head = git_repo / ".git" / "MERGE_HEAD"
-        merge_head.write_text("abc123")
-        
+        import subprocess
+
+        # Create a real merge conflict so git status shows unmerged entries
+        (git_repo / "conflict.txt").write_text("version 1")
+        subprocess.run(["git", "add", "conflict.txt"], cwd=git_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "base"],
+            cwd=git_repo, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "-b", "merge_src"],
+            cwd=git_repo, capture_output=True,
+        )
+        (git_repo / "conflict.txt").write_text("version 2")
+        subprocess.run(["git", "add", "conflict.txt"], cwd=git_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "side"],
+            cwd=git_repo, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "master"],
+            cwd=git_repo, capture_output=True,
+        )
+        (git_repo / "conflict.txt").write_text("version 3")
+        subprocess.run(["git", "add", "conflict.txt"], cwd=git_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "main side"],
+            cwd=git_repo, capture_output=True,
+        )
+        # Start merge that will conflict
+        subprocess.run(
+            ["git", "merge", "merge_src"],
+            cwd=git_repo, capture_output=True,
+        )
+
         watcher = GitWatcher(git_repo)
         watcher.connect()
-        
+
         state = watcher.get_state()
-        
+
         assert state.is_merging
         assert state.is_conflict_resolution_in_progress
 
     def test_rebase_in_progress_detected(self, git_repo: Path):
         """Test that rebase in progress is detected."""
-        # Create rebase directory to simulate rebase
-        rebase_dir = git_repo / ".git" / "rebase-merge"
-        rebase_dir.mkdir()
-        
+        import subprocess
+
+        # Create a real rebase conflict
+        (git_repo / "rebase_file.txt").write_text("version 1")
+        subprocess.run(["git", "add", "rebase_file.txt"], cwd=git_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "base"],
+            cwd=git_repo, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "-b", "rebase_src"],
+            cwd=git_repo, capture_output=True,
+        )
+        (git_repo / "rebase_file.txt").write_text("version 2")
+        subprocess.run(["git", "add", "rebase_file.txt"], cwd=git_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "side"],
+            cwd=git_repo, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "master"],
+            cwd=git_repo, capture_output=True,
+        )
+        (git_repo / "rebase_file.txt").write_text("version 3")
+        subprocess.run(["git", "add", "rebase_file.txt"], cwd=git_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "main side"],
+            cwd=git_repo, capture_output=True,
+        )
+        # Start rebase that will conflict
+        subprocess.run(
+            ["git", "rebase", "rebase_src"],
+            cwd=git_repo, capture_output=True,
+        )
+
         watcher = GitWatcher(git_repo)
         watcher.connect()
-        
+
         state = watcher.get_state()
-        
+
         assert state.is_rebasing
         assert state.is_conflict_resolution_in_progress
 
@@ -264,6 +326,68 @@ class TestGitWatcher:
             watcher.connect()
         
         assert "Invalid commit hash" in str(exc_info.value)
+
+
+class TestGitWatcherStaleMarkers:
+    """Tests that stale merge/rebase markers are ignored when no unmerged files exist."""
+
+    def test_merge_head_without_unmerged_not_detected(self, git_repo: Path):
+        """Stale MERGE_HEAD without unmerged entries should not be treated as merge."""
+        (git_repo / ".git" / "MERGE_HEAD").write_text("abc123")
+
+        watcher = GitWatcher(git_repo)
+        watcher.connect()
+        state = watcher.get_state()
+
+        assert not state.is_merging
+        assert not state.is_conflict_resolution_in_progress
+
+    def test_rebase_head_without_unmerged_not_detected(self, git_repo: Path):
+        """Stale REBASE_HEAD without unmerged entries should not be treated as rebase."""
+        (git_repo / ".git" / "REBASE_HEAD").write_text("abc123")
+
+        watcher = GitWatcher(git_repo)
+        watcher.connect()
+        state = watcher.get_state()
+
+        assert not state.is_rebasing
+        assert not state.is_conflict_resolution_in_progress
+
+    def test_rebase_merge_dir_without_unmerged_not_detected(self, git_repo: Path):
+        """Stale rebase-merge/ without unmerged entries should not be treated as rebase."""
+        (git_repo / ".git" / "rebase-merge").mkdir()
+
+        watcher = GitWatcher(git_repo)
+        watcher.connect()
+        state = watcher.get_state()
+
+        assert not state.is_rebasing
+        assert not state.is_conflict_resolution_in_progress
+
+    def test_rebase_apply_dir_without_unmerged_not_detected(self, git_repo: Path):
+        """Stale rebase-apply/ without unmerged entries should not be treated as rebase."""
+        (git_repo / ".git" / "rebase-apply").mkdir()
+
+        watcher = GitWatcher(git_repo)
+        watcher.connect()
+        state = watcher.get_state()
+
+        assert not state.is_rebasing
+        assert not state.is_conflict_resolution_in_progress
+
+    def test_stale_markers_do_not_block_change_detection(self, git_repo: Path):
+        """Stale markers should not prevent detection of real changed files."""
+        (git_repo / ".git" / "MERGE_HEAD").write_text("abc123")
+        (git_repo / "new_file.txt").write_text("new content")
+
+        watcher = GitWatcher(git_repo)
+        watcher.connect()
+        state = watcher.get_state()
+
+        assert not state.is_merging
+        assert state.has_changes
+        paths = [f.path for f in state.changed_files]
+        assert "new_file.txt" in paths
 
 
 class TestGitWatcherBranchMode:
@@ -285,6 +409,10 @@ class TestGitWatcherBranchMode:
 
     def test_branch_mode_no_main_branch(self, git_repo: Path):
         """Test branch mode when there's no main/master branch falls back gracefully."""
+        import subprocess
+        subprocess.run(
+            ["git", "branch", "-m", "develop"], cwd=git_repo, capture_output=True
+        )
         watcher = GitWatcher(git_repo, scan_mode=ScanMode.BRANCH)
         watcher.connect()
         state = watcher.get_state()
@@ -427,3 +555,145 @@ class TestGitWatcherBranchMode:
         base2 = watcher._resolve_branch_base()
         assert base1 == base2
         assert watcher._branch_base is not None
+
+    def test_branch_mode_on_main_scans_entire_codebase(self, git_repo: Path):
+        """Test branch mode on 'main' branch compares against root of history."""
+        import subprocess
+
+        subprocess.run(
+            ["git", "branch", "-m", "main"], cwd=git_repo, capture_output=True
+        )
+
+        (git_repo / "file_a.txt").write_text("content a")
+        subprocess.run(["git", "add", "file_a.txt"], cwd=git_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Add file_a"],
+            cwd=git_repo,
+            capture_output=True,
+        )
+
+        (git_repo / "file_b.txt").write_text("content b")
+        subprocess.run(["git", "add", "file_b.txt"], cwd=git_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Add file_b"],
+            cwd=git_repo,
+            capture_output=True,
+        )
+
+        watcher = GitWatcher(git_repo, scan_mode=ScanMode.BRANCH)
+        watcher.connect()
+
+        base = watcher._resolve_branch_base()
+        assert base is not None
+        assert len(base) == 40
+
+        state = watcher.get_state()
+        paths = {f.path for f in state.changed_files}
+        assert "README.md" in paths
+        assert "file_a.txt" in paths
+        assert "file_b.txt" in paths
+
+    def test_branch_mode_on_master_scans_entire_codebase(self, git_repo: Path):
+        """Test branch mode on 'master' branch compares against root of history."""
+        import subprocess
+
+        subprocess.run(
+            ["git", "branch", "-m", "master"], cwd=git_repo, capture_output=True
+        )
+
+        (git_repo / "only_file.txt").write_text("content")
+        subprocess.run(["git", "add", "only_file.txt"], cwd=git_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Add only_file"],
+            cwd=git_repo,
+            capture_output=True,
+        )
+
+        watcher = GitWatcher(git_repo, scan_mode=ScanMode.BRANCH)
+        watcher.connect()
+
+        base = watcher._resolve_branch_base()
+        assert base is not None
+        assert len(base) == 40
+
+        state = watcher.get_state()
+        paths = {f.path for f in state.changed_files}
+        assert "README.md" in paths
+        assert "only_file.txt" in paths
+
+    def test_branch_mode_custom_base_branch(self, git_repo: Path):
+        """Test branch mode with a custom base branch name via CLI/config."""
+        import subprocess
+
+        subprocess.run(
+            ["git", "branch", "-m", "develop"], cwd=git_repo, capture_output=True
+        )
+
+        (git_repo / "develop_file.txt").write_text("develop")
+        subprocess.run(["git", "add", "develop_file.txt"], cwd=git_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "develop commit"],
+            cwd=git_repo,
+            capture_output=True,
+        )
+
+        subprocess.run(
+            ["git", "checkout", "-b", "feature"], cwd=git_repo, capture_output=True
+        )
+        (git_repo / "feature_file.txt").write_text("feature")
+        subprocess.run(["git", "add", "feature_file.txt"], cwd=git_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Feature commit"],
+            cwd=git_repo,
+            capture_output=True,
+        )
+
+        watcher = GitWatcher(git_repo, scan_mode=ScanMode.BRANCH, base_branch="develop")
+        watcher.connect()
+
+        state = watcher.get_state()
+        paths = [f.path for f in state.changed_files]
+        assert "feature_file.txt" in paths
+        assert "develop_file.txt" not in paths
+
+    def test_branch_mode_custom_base_branch_not_found(self, git_repo: Path):
+        """Test that custom base branch is tried first and falls back gracefully."""
+        import subprocess
+
+        subprocess.run(
+            ["git", "branch", "-m", "main"], cwd=git_repo, capture_output=True
+        )
+
+        (git_repo / "main_file.txt").write_text("main")
+        subprocess.run(["git", "add", "main_file.txt"], cwd=git_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "main commit"],
+            cwd=git_repo,
+            capture_output=True,
+        )
+
+        subprocess.run(
+            ["git", "checkout", "-b", "feature"], cwd=git_repo, capture_output=True
+        )
+        (git_repo / "feature_file.txt").write_text("feature")
+        subprocess.run(["git", "add", "feature_file.txt"], cwd=git_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Feature commit"],
+            cwd=git_repo,
+            capture_output=True,
+        )
+
+        watcher = GitWatcher(git_repo, scan_mode=ScanMode.BRANCH, base_branch="nonexistent")
+        watcher.connect()
+
+        state = watcher.get_state()
+        paths = [f.path for f in state.changed_files]
+        assert "feature_file.txt" in paths
+
+    def test_branch_mode_detect_remote_default(self, git_repo: Path):
+        """Test _detect_remote_default_branch reads origin/HEAD symref."""
+        watcher = GitWatcher(git_repo, scan_mode=ScanMode.BRANCH)
+        watcher.connect()
+
+        result = watcher._detect_remote_default_branch()
+        assert result is None

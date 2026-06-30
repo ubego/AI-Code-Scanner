@@ -6,6 +6,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from pydantic import ValidationError
+
 from .config import Config
 from .ctags_index import CtagsIndex
 from .file_filter import FileFilter
@@ -204,11 +206,14 @@ class Scanner:
         while not self._stop_event.is_set():
             try:
                 # Get current git state
-                git_state = self.git_watcher.get_state()
+                git_state = self.git_watcher.get_state(
+                    project_name=self._project.project_id if self._project else None
+                )
 
                 # Wait if merge/rebase in progress
                 if git_state.is_conflict_resolution_in_progress:
-                    logger.info("Waiting for merge/rebase to complete...")
+                    project_label = f"[{self._project.project_id}] " if self._project else ""
+                    logger.info("%sWaiting for merge/rebase to complete...", project_label)
                     self._update_status(ScanStatus.WAITING_MERGE_REBASE)
                     time.sleep(self.config.git_poll_interval)
                     continue
@@ -951,6 +956,92 @@ class Scanner:
         
         return parsed_issues
 
+    def _validate_llm_response(self, response: dict[str, Any]) -> Optional[str]:
+        """Validate that an LLM response matches the expected scan-response schema.
+
+        Uses Pydantic to validate the response.  On failure the method returns
+        a structured error message that includes the concrete JSON schema the
+        LLM must follow, so it can correct its mistake in a follow-up query.
+
+        Args:
+            response: Raw LLM response dictionary.
+
+        Returns:
+            ``None`` if the response is valid, otherwise an error message string
+            suitable for asking the LLM to correct its output.
+        """
+        try:
+            sanitized_response = sanitize_llm_response(response)
+            LLMScanResponse.model_validate(sanitized_response)
+            return None
+        except ValidationError as e:
+            error_count = e.error_count()
+            error_lines: list[str] = []
+            for err in e.errors(include_url=False):
+                loc = " → ".join(str(part) for part in err["loc"]) if err["loc"] else "(root)"
+                error_lines.append(f"  Field [{loc}]: {err['msg']} (type={err['type']})")
+            error_summary = "\n".join(error_lines[:10])
+            if error_count > 10:
+                error_summary += f"\n  ... and {error_count - 10} more error(s)"
+            schema_json = LLMScanResponse.model_json_schema()
+            schema_str = self._format_json_schema_for_llm(schema_json)
+            return (
+                f"Your response failed Pydantic validation with {error_count} error(s):\n"
+                f"{error_summary}\n\n"
+                f"Expected JSON schema:\n"
+                f"{schema_str}\n\n"
+                f"Do NOT include markdown fences, explanations, or extra text. "
+                f"Return ONLY the raw JSON object."
+            )
+        except Exception as exc:
+            error_detail = str(exc)[:512]
+            return (
+                f"Response validation failed: {error_detail}\n\n"
+                f"Please reformat your response as valid JSON matching "
+                f'this exact structure:\n'
+                f'{{"issues": [{{"file_path": "path/to/file", "line_number": N, '
+                f'"description": "...", "suggested_fix": "...", '
+                f'"code_snippet": "..."}}]}}\n\n'
+                f"If you found no issues, return: {{\"issues\": []}}"
+            )
+
+    def _format_json_schema_for_llm(self, schema: dict[str, Any]) -> str:
+        """Render a compact JSON-schema summary suitable for an LLM prompt.
+
+        Flattens deeply nested ``$defs`` / ``anyOf`` / ``allOf`` where possible
+        so the LLM can see the expected field names and types at a glance.
+        """
+        import json
+
+        # Build a simplified schema summary
+        simplified: dict[str, Any] = {
+            "type": schema.get("type", "object"),
+            "required": schema.get("required", []),
+        }
+
+        properties = schema.get("properties", {})
+        if "issues" in properties:
+            issue_props = (properties["issues"]
+                           .get("items", {})
+                           .get("$ref", ""))
+            if issue_props and "$defs" in schema:
+                ref_key = issue_props.split("/")[-1]
+                def_entry = schema["$defs"].get(ref_key, {})
+                simplified["properties"] = {
+                    "issues": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": def_entry.get("properties", {}),
+                            "required": def_entry.get("required", []),
+                        },
+                    }
+                }
+            else:
+                simplified["properties"] = properties
+
+        return json.dumps(simplified, indent=2)
+
     def _run_check(
         self,
         check_query: str,
@@ -1049,9 +1140,13 @@ class Scanner:
         
         # Cap at 50 to prevent endless loops, but use context-based limit if smaller
         max_tool_iterations = min(estimated_possible_iterations, 50)
+        MAX_MALFORMED_TOOL_RESPONSES = 3
         logger.debug(f"Max tool iterations set to {max_tool_iterations} (based on context: {estimated_possible_iterations}, capped at 50)")
 
         iteration = 0
+        malformed_count = 0
+        validation_retries = 0
+        MAX_VALIDATION_RETRIES = 3
 
         while iteration < max_tool_iterations:
             iteration += 1
@@ -1067,8 +1162,54 @@ class Scanner:
 
                 # Check if LLM wants to use tools
                 if LLMToolCallResponse.is_tool_call(response):
-                    validated_tc = LLMToolCallResponse.model_validate(response)
+                    # Validate tool call format through Pydantic
+                    try:
+                        validated_tc = LLMToolCallResponse.model_validate(response)
+                    except Exception as e:
+                        logger.warning(
+                            f"LLM returned malformed tool call response (iteration {iteration}): {e}. "
+                            "Asking LLM to correct."
+                        )
+                        malformed_count += 1
+                        if malformed_count > MAX_MALFORMED_TOOL_RESPONSES:
+                            logger.warning(
+                                f"Too many malformed tool call responses ({malformed_count}). "
+                                "Forcing LLM to finalize without tools."
+                            )
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "You have repeatedly sent malformed tool call requests. "
+                                    "Do NOT request any more tools. "
+                                    "Provide your FINAL analysis now with issues found."
+                                ),
+                            })
+                            break
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"Your previous tool call request was malformed and could not be processed: {e}\n\n"
+                                "Please correct the format and try again. "
+                                "Each tool call must have 'tool_name' (string) and 'arguments' (object) fields."
+                            ),
+                        })
+                        continue
+
                     tool_calls = [tc.model_dump() for tc in validated_tc.tool_calls]
+
+                    if not tool_calls:
+                        logger.warning(
+                            f"LLM returned empty tool_calls list (iteration {iteration}). "
+                            "Asking LLM to either call tools or provide final answer."
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "You indicated you want to use tools but provided an empty tool_calls list. "
+                                "Either request valid tool calls or provide your final analysis with issues found."
+                            ),
+                        })
+                        continue
                     tool_names = [tc["tool_name"] for tc in tool_calls]
                     logger.info(f"LLM requested {len(tool_calls)} tool call(s): {', '.join(tool_names)} (iteration {iteration})")
 
@@ -1148,9 +1289,33 @@ class Scanner:
 
                 # Check if LLM provided final answer (no more tool calls)
                 if not LLMToolCallResponse.is_tool_call(response):
-                    # LLM provided final answer
-                    logger.debug(f"LLM provided final answer (iteration {iteration})")
-                    break  # Exit tool calling loop
+                    # Validate the response before accepting as final
+                    validation_error = self._validate_llm_response(response)
+                    if validation_error is None:
+                        logger.debug(f"LLM provided valid final answer (iteration {iteration})")
+                        break
+                    else:
+                        logger.warning(
+                            f"LLM response validation failed (iteration {iteration}, "
+                            f"attempt {validation_retries + 1}/{MAX_VALIDATION_RETRIES}): "
+                            f"{str(validation_error)[:200]}"
+                        )
+                        validation_retries += 1
+                        if validation_retries >= MAX_VALIDATION_RETRIES:
+                            logger.warning(
+                                f"Max validation retries ({MAX_VALIDATION_RETRIES}) reached, "
+                                "accepting empty result"
+                            )
+                            response = {"issues": []}
+                            break
+                        last_context = messages[-1]["content"]
+                        correction_prompt = (
+                            f"{last_context}\n\n"
+                            f"---\n\n"
+                            f"{validation_error}"
+                        )
+                        messages.append({"role": "user", "content": correction_prompt})
+                        continue
 
             except LLMClientError as e:
                 # LLM error - log and re-raise

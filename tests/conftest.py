@@ -1,9 +1,13 @@
 """Pytest configuration and fixtures."""
 
 import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
 import shutil
 import tempfile
-from pathlib import Path
 from typing import Generator
 from unittest.mock import MagicMock, patch
 

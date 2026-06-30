@@ -66,7 +66,7 @@ class TestBuildUserPrompt:
 
 
 class TestStripMarkdownFences:
-    """Tests for _strip_markdown_fences method."""
+    """Tests for strip_markdown_fences method."""
 
     def test_strip_json_fence(self):
         """Strip ```json ... ``` fences."""
@@ -74,7 +74,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '```json\n{"issues": []}\n```'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
     def test_strip_plain_fence(self):
@@ -83,7 +83,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '```\n{"issues": []}\n```'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
     def test_no_fence_unchanged(self):
@@ -92,7 +92,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '{"issues": []}'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
     def test_whitespace_handling(self):
@@ -101,7 +101,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '  ```json\n{"issues": []}\n```  '
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
     def test_case_insensitive(self):
@@ -110,7 +110,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '```JSON\n{"issues": []}\n```'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
 

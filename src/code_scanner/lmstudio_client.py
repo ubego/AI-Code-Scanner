@@ -2,23 +2,22 @@
 
 import json
 import logging
-import re
-import time
 from typing import Any, Optional
 
 from openai import OpenAI, APIConnectionError, APIError
 
-from .base_client import BaseLLMClient, LLMClientError, ContextOverflowError, RequestBuilder
+from .base_client import (
+    BaseLLMClient, LLMClientError, ContextOverflowError, RequestBuilder,
+    StreamAccumulator, JSON_FIX_SYSTEM_PROMPT,
+)
 from .models import LLMConfig, LLMToolCallResponse
 from .stream_validator import (
-    StreamValidator,
     RunawayGenerationError,
     ResponseSizeExceededError,
 )
 
 logger = logging.getLogger(__name__)
 
-# Re-export exceptions for backward compatibility
 __all__ = ["LMStudioClient", "LLMClient", "LLMClientError", "ContextOverflowError"]
 
 
@@ -31,11 +30,10 @@ class LMStudioClient(BaseLLMClient):
         Args:
             config: LLM configuration with host, port, etc.
         """
+        super().__init__()
         self.config = config
         self._client: Optional[OpenAI] = None
-        self._context_limit: Optional[int] = None
-        self._model_id: Optional[str] = None
-        self._supports_json_format: bool = True  # Assume supported, fallback if not
+        self._supports_json_format: bool = True
 
     @property
     def backend_name(self) -> str:
@@ -181,28 +179,6 @@ class LMStudioClient(BaseLLMClient):
 
         return None
 
-    @property
-    def context_limit(self) -> int:
-        """Get the context limit in tokens.
-
-        Raises:
-            LLMClientError: If not connected or limit unavailable.
-        """
-        if self._context_limit is None:
-            raise LLMClientError("Not connected or context limit unavailable")
-        return self._context_limit
-
-    @property
-    def model_id(self) -> str:
-        """Get the model ID being used.
-
-        Raises:
-            LLMClientError: If not connected.
-        """
-        if self._model_id is None:
-            raise LLMClientError("Not connected")
-        return self._model_id
-
     def query(
         self,
         system_prompt: str,
@@ -254,8 +230,7 @@ class LMStudioClient(BaseLLMClient):
 
                 stream = self._client.chat.completions.create(**request_params)
 
-                validator = StreamValidator()
-                accumulated_content_parts: list[str] = []
+                acc = StreamAccumulator()
                 tool_call_buffers: dict[int, dict] = {}
 
                 for chunk in stream:
@@ -264,11 +239,8 @@ class LMStudioClient(BaseLLMClient):
 
                     delta = chunk.choices[0].delta
 
-                    if delta.content:
-                        accumulated_content_parts.append(delta.content)
-                        validator.feed(delta.content)
-                    else:
-                        validator.feed("")
+                    content_delta = delta.content or ""
+                    acc.feed(content_delta)
 
                     if delta.tool_calls:
                         for tc_delta in delta.tool_calls:
@@ -299,41 +271,29 @@ class LMStudioClient(BaseLLMClient):
                             "arguments": args,
                         })
                     logger.info(f"LLM requested {len(tool_calls)} tool call(s)")
-                    validated = LLMToolCallResponse.model_validate({"tool_calls": tool_calls})
-                    return validated.model_dump()
+                    try:
+                        validated = LLMToolCallResponse.model_validate({"tool_calls": tool_calls})
+                        return validated.model_dump()
+                    except Exception as e:
+                        logger.warning(
+                            f"LM Studio returned malformed tool calls (attempt {attempt + 1}/{max_retries}): {e}. "
+                            "Will retry to get corrected response."
+                        )
+                        last_raw_response = f"Malformed tool calls: {e}"
+                        continue
 
-                content = "".join(accumulated_content_parts)
+                content = acc.content
                 if not content:
                     logger.warning(f"Empty response from LLM (attempt {attempt + 1}/{max_retries}). Will retry automatically.")
                     continue
 
-                # Strip markdown code fences if present (common LLM behavior)
-                content = self._strip_markdown_fences(content)
-
-                # Parse JSON response
-                try:
-                    result = json.loads(content)
+                content = self.strip_markdown_fences(content)
+                parsed = self._parse_and_fix_json_response(content, attempt, max_retries)
+                if parsed is not None:
                     logger.debug("Successfully parsed JSON response")
-                    return result
-                except json.JSONDecodeError as e:
-                    # This is normal - LLMs sometimes return non-JSON. Auto-fix will handle it.
-                    last_raw_response = content if content else "(empty)"
-                    raw_preview = content[:500] if content else "(empty)"
-                    logger.info(
-                        f"LLM returned non-JSON response (attempt {attempt + 1}/{max_retries}). "
-                        f"This is normal and will be auto-corrected.\n"
-                        f"Parse error: {e}"
-                    )
-                    logger.debug(f"--- Raw LLM response ---\n{raw_preview}\n--- End raw response ---")
-                    
-                    # Try to get LLM to fix its own response
-                    fix_result = self._try_fix_json_response(content)
-                    if fix_result is not None:
-                        logger.info("LLM successfully reformatted response to valid JSON.")
-                        return fix_result
-                    
-                    # If fix failed, continue to next retry attempt
-                    continue
+                    return parsed
+                last_raw_response = content if content else "(empty)"
+                continue
 
             except (RunawayGenerationError, ResponseSizeExceededError) as e:
                 logger.warning(
@@ -343,7 +303,16 @@ class LMStudioClient(BaseLLMClient):
                 continue
 
             except APIConnectionError as e:
-                # Connection lost mid-session - this needs special handling
+                error_msg = str(e).lower()
+                if "time" in error_msg and "out" in error_msg:
+                    logger.warning(
+                        f"LM Studio request timed out (attempt {attempt + 1}/{max_retries}). "
+                        f"The model is taking longer than {self.config.timeout}s to respond.\n"
+                        f"Tips: 1) Increase 'timeout' in config.toml, "
+                        f"2) Lower 'context_limit' to reduce processing time, "
+                        f"3) Use a smaller/faster model."
+                    )
+                    continue
                 raise LLMClientError(f"Lost connection to LM Studio: {e}")
             except APIError as e:
                 error_msg = str(e)
@@ -414,14 +383,7 @@ class LMStudioClient(BaseLLMClient):
                 "messages": [
                     {
                         "role": "system",
-                        "content": (
-                            "You are a JSON extractor. Extract and return ONLY valid JSON. "
-                            "Do NOT include markdown code fences (```), explanations, or any other text. "
-                            "Output ONLY the raw JSON object, nothing else. "
-                            "Expected format: {\"issues\": [{\"file\": \"...\", \"line_number\": N, "
-                            "\"description\": \"...\", \"suggested_fix\": \"...\", \"code_snippet\": \"...\"}]} "
-                            "If the input has no valid issues, return: {\"issues\": []}"
-                        )
+                        "content": JSON_FIX_SYSTEM_PROMPT,
                     },
                     {
                         "role": "user",
@@ -441,7 +403,7 @@ class LMStudioClient(BaseLLMClient):
 
             if content:
                 # Strip markdown fences from fix response too
-                content = self._strip_markdown_fences(content)
+                content = self.strip_markdown_fences(content)
                 result = json.loads(content)
                 return result
 
@@ -449,75 +411,6 @@ class LMStudioClient(BaseLLMClient):
             logger.debug(f"JSON fix attempt failed: {e}")
 
         return None
-
-    def _strip_markdown_fences(self, content: str) -> str:
-        """Strip markdown code fences from content.
-
-        LLMs often wrap JSON in ```json ... ``` blocks despite instructions not to.
-        This extracts the content inside the fences.
-
-        Args:
-            content: Raw response content.
-
-        Returns:
-            Content with markdown fences stripped.
-        """
-        content = content.strip()
-
-        # Pattern to match ```json or ``` at start and ``` at end
-        # Handles: ```json\n{...}\n``` or ```\n{...}\n```
-        fence_pattern = re.compile(
-            r'^```(?:json)?\s*\n?(.*?)\n?```\s*$',
-            re.DOTALL | re.IGNORECASE
-        )
-
-        match = fence_pattern.match(content)
-        if match:
-            return match.group(1).strip()
-
-        return content
-
-    def wait_for_connection(self, retry_interval: int = 10, max_attempts: int = 0) -> None:
-        """Wait for LM Studio to become available.
-
-        Retries connection every `retry_interval` seconds until successful.
-        If `max_attempts` is > 0, stops after that many attempts.
-
-        Args:
-            retry_interval: Seconds between retry attempts.
-            max_attempts: Maximum connection attempts (0 = unlimited).
-        """
-        logger.info("Waiting for LM Studio connection...")
-        attempt = 0
-
-        while True:
-            attempt += 1
-            try:
-                self.connect()
-                logger.info("LM Studio connection restored")
-                return
-            except LLMClientError as e:
-                logger.warning(f"Connection failed (attempt {attempt}): {e}")
-                if 0 < max_attempts <= attempt:
-                    raise
-                logger.info(f"Retrying in {retry_interval} seconds...")
-                time.sleep(retry_interval)
-
-
-
-    def set_context_limit(self, limit: int) -> None:
-        """Manually set the context limit.
-
-        Args:
-            limit: Context limit in tokens.
-
-        Raises:
-            ValueError: If limit is not positive.
-        """
-        if limit <= 0:
-            raise ValueError("Context limit must be a positive integer")
-        self._context_limit = limit
-        logger.info(f"Context limit manually set to: {limit} tokens")
 
 
 # Backward compatibility alias - LLMClient maps to LMStudioClient

@@ -80,7 +80,7 @@ class TestOllamaClientCoverage:
         client3.connect()
         assert client3.context_limit == 1024
 
-    @patch("code_scanner.ollama_client.time.sleep")
+    @patch("code_scanner.base_client.time.sleep")
     @patch("code_scanner.ollama_client.urllib.request.urlopen")
     def test_wait_for_connection(self, mock_urlopen, mock_sleep, ollama_config):
         """Test wait_for_connection re-tries."""

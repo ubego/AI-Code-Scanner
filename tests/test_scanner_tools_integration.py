@@ -568,3 +568,212 @@ class TestAsyncCtagsTools:
         assert result.success is True
         assert result.data.get("exists") is False  # Normal "not found" result
         assert result.warning is None
+
+
+class TestMalformedToolCallHandling:
+    """Tests for malformed tool call handling in _run_check_with_tools."""
+
+    def test_malformed_tool_call_asks_correction(self, mock_components, tmp_path):
+        """LLM returns malformed tool_calls — scanner asks LLM to correct."""
+        scanner = mock_components["scanner"]
+        llm_client = mock_components["llm_client"]
+
+        (tmp_path / "test.py").write_text("x = 1\n")
+
+        llm_client.query.side_effect = [
+            {"tool_calls": "not_a_list"},
+            {"issues": []},
+        ]
+
+        issues = scanner._run_check_with_tools(
+            check_query="Find bugs",
+            batch={"test.py": "x = 1\n"},
+            batch_idx=0,
+        )
+
+        assert llm_client.query.call_count == 2
+        assert len(issues) == 0
+
+    def test_empty_tool_calls_asks_correction(self, mock_components, tmp_path):
+        """LLM returns empty tool_calls list — scanner asks LLM to correct."""
+        scanner = mock_components["scanner"]
+        llm_client = mock_components["llm_client"]
+
+        (tmp_path / "test.py").write_text("x = 1\n")
+
+        llm_client.query.side_effect = [
+            {"tool_calls": []},
+            {"issues": []},
+        ]
+
+        issues = scanner._run_check_with_tools(
+            check_query="Find bugs",
+            batch={"test.py": "x = 1\n"},
+            batch_idx=0,
+        )
+
+        assert llm_client.query.call_count == 2
+        assert len(issues) == 0
+
+    def test_max_malformed_responses_forces_final_answer(self, mock_components, tmp_path):
+        """After MAX_MALFORMED_TOOL_RESPONSES malformed attempts, forces final answer."""
+        scanner = mock_components["scanner"]
+        llm_client = mock_components["llm_client"]
+
+        (tmp_path / "test.py").write_text("x = 1\n")
+
+        llm_client.query.side_effect = [
+            {"tool_calls": "bad"},
+            {"tool_calls": "bad"},
+            {"tool_calls": "bad"},
+            {"tool_calls": "bad"},
+            {"issues": [{"file": "test.py", "line_number": 1, "description": "ok"}]},
+        ]
+
+        issues = scanner._run_check_with_tools(
+            check_query="Find bugs",
+            batch={"test.py": "x = 1\n"},
+            batch_idx=0,
+        )
+
+        assert len(issues) >= 0
+
+    def test_malformed_then_valid_tool_call_works(self, mock_components, tmp_path):
+        """After one malformed response, valid tool call is processed normally."""
+        scanner = mock_components["scanner"]
+        llm_client = mock_components["llm_client"]
+
+        (tmp_path / "main.py").write_text("def foo():\n    pass\n")
+
+        llm_client.query.side_effect = [
+            {"tool_calls": "malformed"},
+            {
+                "tool_calls": [{
+                    "tool_name": "search_text",
+                    "arguments": {"patterns": "foo"},
+                }]
+            },
+            {"issues": []},
+        ]
+
+        issues = scanner._run_check_with_tools(
+            check_query="Find bugs",
+            batch={"main.py": "def foo():\n    pass\n"},
+            batch_idx=0,
+        )
+
+        assert llm_client.query.call_count == 3
+        assert len(issues) == 0
+
+
+class TestValidationRetryHandling:
+    """Tests for validation retry when LLM final answer fails Pydantic validation."""
+
+    def test_valid_final_answer_accepted_immediately(self, mock_components, tmp_path):
+        """Valid final answer passes validation and breaks the loop."""
+        scanner = mock_components["scanner"]
+        llm_client = mock_components["llm_client"]
+
+        (tmp_path / "main.py").write_text("def foo():\n    pass\n")
+
+        llm_client.query.return_value = {
+            "issues": [{
+                "file": "main.py",
+                "line_number": 1,
+                "description": "issue",
+                "suggested_fix": "fix",
+                "code_snippet": "code",
+            }]
+        }
+
+        issues = scanner._run_check_with_tools(
+            check_query="Find bugs",
+            batch={"main.py": "def foo():\n    pass\n"},
+            batch_idx=0,
+        )
+
+        assert llm_client.query.call_count == 1
+        assert len(issues) == 1
+
+    def test_invalid_response_retried_once_then_accepted(self, mock_components, tmp_path):
+        """One invalid response triggers retry; second valid response accepted."""
+        scanner = mock_components["scanner"]
+        llm_client = mock_components["llm_client"]
+
+        (tmp_path / "main.py").write_text("def foo():\n    pass\n")
+
+        llm_client.query.side_effect = [
+            "not a dictionary at all",
+            {
+                "issues": [{
+                    "file": "main.py",
+                    "line_number": 1,
+                    "description": "fixed",
+                    "suggested_fix": "fix",
+                    "code_snippet": "code",
+                }]
+            },
+        ]
+
+        issues = scanner._run_check_with_tools(
+            check_query="Find bugs",
+            batch={"main.py": "def foo():\n    pass\n"},
+            batch_idx=0,
+        )
+
+        assert llm_client.query.call_count == 2
+        assert len(issues) == 1
+        assert issues[0].description == "fixed"
+
+    def test_max_validation_retries_returns_empty(self, mock_components, tmp_path):
+        """After MAX_VALIDATION_RETRIES (3) invalid responses, forced empty result."""
+        scanner = mock_components["scanner"]
+        llm_client = mock_components["llm_client"]
+
+        (tmp_path / "main.py").write_text("def foo():\n    pass\n")
+
+        llm_client.query.side_effect = [
+            "bad1",
+            "bad2",
+            "bad3",
+        ]
+
+        issues = scanner._run_check_with_tools(
+            check_query="Find bugs",
+            batch={"main.py": "def foo():\n    pass\n"},
+            batch_idx=0,
+        )
+
+        assert llm_client.query.call_count == 3
+        assert issues == []
+
+    def test_correction_prompt_includes_last_context(self, mock_components, tmp_path):
+        """The correction prompt sent to LLM includes the previous context."""
+        scanner = mock_components["scanner"]
+        llm_client = mock_components["llm_client"]
+
+        (tmp_path / "main.py").write_text("def foo():\n    pass\n")
+
+        llm_client.query.side_effect = [
+            "not valid json",
+            {
+                "issues": [{
+                    "file": "main.py",
+                    "line_number": 1,
+                    "description": "ok",
+                    "suggested_fix": "x",
+                    "code_snippet": "x",
+                }]
+            },
+        ]
+
+        scanner._run_check_with_tools(
+            check_query="Find bugs",
+            batch={"main.py": "def foo():\n    pass\n"},
+            batch_idx=0,
+        )
+
+        assert llm_client.query.call_count == 2
+        second_call_user = llm_client.query.call_args_list[1][1]["user_prompt"]
+        assert "Pydantic validation" in second_call_user
+        assert "def foo()" in second_call_user

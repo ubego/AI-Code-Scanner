@@ -104,19 +104,36 @@ class TestMergeConflictHandling:
             assert state.is_merging or state.is_conflict_resolution_in_progress
 
     def test_rebase_detection(self, git_repo):
-        """Test detection of rebase in progress."""
-        # Create .git/REBASE_HEAD to simulate rebase
-        rebase_head = git_repo / ".git" / "REBASE_HEAD"
-        rebase_head.write_text("abc123")
-        
+        """Test detection of rebase in progress with real unmerged entries."""
+        import subprocess
+
+        def run(cmd, **kw):
+            return subprocess.run(cmd, cwd=git_repo, capture_output=True, **kw)
+
+        result = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True)
+        base_branch = result.stdout.strip()
+
+        (git_repo / "rebase.txt").write_text("version 1\n")
+        run(["git", "add", "rebase.txt"])
+        run(["git", "commit", "-m", "base"])
+
+        run(["git", "checkout", "-b", "side_rebase"])
+        (git_repo / "rebase.txt").write_text("version 2\n")
+        run(["git", "add", "rebase.txt"])
+        run(["git", "commit", "-m", "side commit"])
+
+        run(["git", "checkout", base_branch])
+        (git_repo / "rebase.txt").write_text("version 3\n")
+        run(["git", "add", "rebase.txt"])
+        run(["git", "commit", "-m", "main commit"])
+
+        run(["git", "rebase", "side_rebase"])
+
         watcher = GitWatcher(git_repo)
         watcher.connect()
         state = watcher.get_state()
-        
+
         assert state.is_rebasing
-        
-        # Cleanup
-        rebase_head.unlink()
 
 
 class TestIsIgnoredFallback:

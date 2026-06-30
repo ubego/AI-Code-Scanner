@@ -274,11 +274,15 @@ def setup_logging(log_file: Path, debug: bool = False, project_manager=None) -> 
     console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
 
-    # File handler (no colors)
+    # File handler (no colors) – truncate explicitly to avoid stale content
     if not log_file.parent.exists():
         log_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        log_file.write_text("", encoding="utf-8")
+    except OSError:
+        pass
 
-    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
+    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8", errors="replace")
     file_handler.setLevel(log_level)
     file_handler.setFormatter(file_formatter)
     root_logger.addHandler(file_handler)
@@ -290,26 +294,45 @@ def setup_logging(log_file: Path, debug: bool = False, project_manager=None) -> 
 
     # Set up project prefix filter if project manager is provided
     if project_manager:
-        # Add a filter that adds project prefixes to log records
         class ProjectPrefixFilter(logging.Filter):
-            """Filter that adds project prefix to log records."""
+            """Adds ``project_prefix`` attribute to log records."""
 
             def __init__(self, project_manager):
                 super().__init__()
                 self.project_manager = project_manager
 
             def filter(self, record):
-                """Add project prefix to log record."""
-                active_project = self.project_manager.get_active_project()
-                if active_project:
-                    # Add project prefix to the message
-                    record.msg = f"[{active_project.project_id}] {record.msg}"
-                else:
-                    record.msg = f"[SYSTEM] {record.msg}"
+                try:
+                    active_project = self.project_manager.get_active_project()
+                    record.project_prefix = (
+                        f"[{active_project.project_id}] "
+                        if active_project
+                        else "[SYSTEM] "
+                    )
+                except Exception:
+                    record.project_prefix = "[SYSTEM] "
                 return True
 
-        # Add filter to root logger
-        root_logger.addFilter(ProjectPrefixFilter(project_manager))
+        for handler in root_logger.handlers:
+            handler.addFilter(ProjectPrefixFilter(project_manager))
+
+    # Rebuild formatters with project_prefix in the format string
+    _fmt = (
+        "%(asctime)s - %(name)s - %(levelname)s - "
+        "%(project_prefix)s%(message)s"
+    ) if project_manager else (
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.setFormatter(logging.Formatter(
+                _fmt, datefmt="%Y-%m-%d %H:%M:%S",
+            ))
+        else:
+            handler.setFormatter(ColoredFormatter(
+                _fmt, datefmt="%Y-%m-%d %H:%M:%S",
+            ))
 
 
 def group_files_by_directory(files: list[str]) -> dict[str, list[str]]:

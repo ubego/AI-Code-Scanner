@@ -1,7 +1,28 @@
 """Abstract base class for LLM clients."""
 
+import json
+import logging
+import re
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# Shared JSON-fix system prompt (used by both client's _try_fix_json_response)
+JSON_FIX_SYSTEM_PROMPT = (
+    "You are a JSON extractor. Extract and return ONLY valid JSON. "
+    "Do NOT include markdown code fences (```), explanations, or any other text. "
+    "Output ONLY the raw JSON object, nothing else. "
+    "Expected format: {\"issues\": [{\"file\": \"...\", \"line_number\": N, "
+    "\"description\": \"...\", \"suggested_fix\": \"...\", \"code_snippet\": \"...\"}]} "
+    "If the input has no valid issues, return: {\"issues\": []}"
+)
+
+_FENCE_PATTERN = re.compile(
+    r'^```(?:json)?\s*\n?(.*?)\n?```\s*$',
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 class LLMClientError(Exception):
@@ -22,10 +43,24 @@ class ContextOverflowError(LLMClientError):
 
 class BaseLLMClient(ABC):
     """Abstract base class for LLM clients.
-    
+
     Both LMStudioClient and OllamaClient must implement this interface
     to ensure interchangeable usage by the Scanner.
+
+    Concrete implementations shared across backends:
+      - ``strip_markdown_fences()``  strip ```json wrappers from LLM output
+      - ``wait_for_connection()``    blocking retry loop
+      - ``set_context_limit()``      manual context limit override
+      - ``context_limit`` / ``model_id`` properties with connected checks
     """
+
+    def __init__(self) -> None:
+        self._context_limit: Optional[int] = None
+        self._model_id: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # Abstract interface — must be implemented by every backend
+    # ------------------------------------------------------------------
 
     @abstractmethod
     def connect(self) -> None:
@@ -53,39 +88,13 @@ class BaseLLMClient(ABC):
             tools: Optional list of tool definitions for function calling.
 
         Returns:
-            Parsed JSON response from the LLM. If tools are provided and LLM 
-            requests tool calls, response includes 'tool_calls' key with list 
+            Parsed JSON response from the LLM. If tools are provided and LLM
+            requests tool calls, response includes 'tool_calls' key with list
             of {tool_name, arguments} dicts.
 
         Raises:
             LLMClientError: If query fails after all retries.
             ContextOverflowError: If context limit is exceeded.
-        """
-        pass
-
-    @property
-    @abstractmethod
-    def context_limit(self) -> int:
-        """Get the context limit in tokens.
-
-        Returns:
-            Context limit in tokens.
-
-        Raises:
-            LLMClientError: If not connected or limit unavailable.
-        """
-        pass
-
-    @property
-    @abstractmethod
-    def model_id(self) -> str:
-        """Get the model ID being used.
-
-        Returns:
-            Model identifier string.
-
-        Raises:
-            LLMClientError: If not connected.
         """
         pass
 
@@ -108,18 +117,61 @@ class BaseLLMClient(ABC):
         """
         pass
 
-    @abstractmethod
-    def wait_for_connection(self, retry_interval: int = 10) -> None:
+    # ------------------------------------------------------------------
+    # Concrete properties — shared across all backends
+    # ------------------------------------------------------------------
+
+    @property
+    def context_limit(self) -> int:
+        """Get the context limit in tokens.
+
+        Raises:
+            LLMClientError: If not connected or limit unavailable.
+        """
+        if self._context_limit is None:
+            raise LLMClientError("Not connected or context limit unavailable")
+        return self._context_limit
+
+    @property
+    def model_id(self) -> str:
+        """Get the model ID being used.
+
+        Raises:
+            LLMClientError: If not connected.
+        """
+        if self._model_id is None:
+            raise LLMClientError("Not connected")
+        return self._model_id
+
+    # ------------------------------------------------------------------
+    # Concrete methods — shared across all backends
+    # ------------------------------------------------------------------
+
+    def wait_for_connection(self, retry_interval: int = 10, max_attempts: int = 0) -> None:
         """Wait for LLM backend to become available.
 
-        Retries connection every `retry_interval` seconds until successful.
+        Retries connection every ``retry_interval`` seconds until successful.
+        If ``max_attempts`` is > 0, stops after that many attempts.
 
         Args:
             retry_interval: Seconds between retry attempts.
+            max_attempts: Maximum connection attempts (0 = unlimited).
         """
-        pass
+        logger.info("Waiting for %s connection...", self.backend_name)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                self.connect()
+                logger.info("%s connection restored", self.backend_name)
+                return
+            except LLMClientError as e:
+                logger.warning("Connection failed (attempt %d): %s", attempt, e)
+                if 0 < max_attempts <= attempt:
+                    raise
+                logger.info("Retrying in %d seconds...", retry_interval)
+                time.sleep(retry_interval)
 
-    @abstractmethod
     def set_context_limit(self, limit: int) -> None:
         """Manually set the context limit.
 
@@ -129,7 +181,95 @@ class BaseLLMClient(ABC):
         Raises:
             ValueError: If limit is not positive.
         """
-        pass
+        if limit <= 0:
+            raise ValueError("Context limit must be a positive integer")
+        self._context_limit = limit
+        logger.info("Context limit manually set to: %d tokens", limit)
+
+    @staticmethod
+    def strip_markdown_fences(content: str) -> str:
+        """Strip markdown code fences from LLM response content.
+
+        LLMs often wrap JSON in ```json ... ``` blocks despite
+        instructions not to.  This extracts the content inside.
+
+        Args:
+            content: Raw response content.
+
+        Returns:
+            Content with markdown fences stripped.
+        """
+        content = content.strip()
+        match = _FENCE_PATTERN.match(content)
+        if match:
+            return match.group(1).strip()
+        return content
+
+    def _try_fix_json_response(self, malformed_content: str) -> Optional[dict]:
+        """Try to get LLM to fix its own malformed JSON response.
+
+        Must be overridden by subclasses since the API call mechanism
+        differs between backends.
+
+        Args:
+            malformed_content: The malformed response from LLM.
+
+        Returns:
+            Parsed JSON dict if successful, None if fix attempt failed.
+        """
+        return None
+
+    def _parse_and_fix_json_response(
+        self, content: str, attempt: int, max_retries: int
+    ) -> Optional[dict]:
+        """Parse LLM content as JSON, auto-fixing via LLM on failure.
+
+        Args:
+            content: Raw LLM response content (fences already stripped).
+            attempt: Current attempt number (0-indexed).
+            max_retries: Maximum number of retries.
+
+        Returns:
+            Parsed JSON dict on success, None if parsing failed and fix
+            also failed.
+        """
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            raw_preview = content[:500] if content else "(empty)"
+            logger.info(
+                "LLM returned non-JSON response (attempt %d/%d). "
+                "This is normal and will be auto-corrected.\nParse error: %s",
+                attempt + 1, max_retries, e,
+            )
+            logger.debug("--- Raw response ---\n%s\n--- End raw response ---", raw_preview)
+            fix_result = self._try_fix_json_response(content)
+            if fix_result is not None:
+                logger.info("%s successfully reformatted response to valid JSON.", self.backend_name)
+                return fix_result
+            return None
+
+
+class StreamAccumulator:
+    """Accumulates streaming content chunks with validation."""
+
+    def __init__(self) -> None:
+        from .stream_validator import StreamValidator
+        self.validator = StreamValidator()
+        self._parts: list[str] = []
+
+    def feed(self, content: str) -> None:
+        """Feed a content chunk. Validates and accumulates."""
+        if content:
+            self._parts.append(content)
+            self.validator.feed(content)
+        else:
+            self.validator.feed("")
+
+    @property
+    def content(self) -> str:
+        """The accumulated full content."""
+        return "".join(self._parts)
 
 
 # System prompt template for code analysis (shared across all backends)

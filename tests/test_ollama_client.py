@@ -425,7 +425,7 @@ class TestOllamaClientModelInfo:
 
 
 class TestStripMarkdownFences:
-    """Tests for _strip_markdown_fences method."""
+    """Tests for strip_markdown_fences method."""
 
     @pytest.fixture
     def client(self) -> OllamaClient:
@@ -442,19 +442,19 @@ class TestStripMarkdownFences:
     def test_strip_json_fences(self, client: OllamaClient):
         """Test stripping ```json fences."""
         content = '```json\n{"issues": []}\n```'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
     def test_strip_plain_fences(self, client: OllamaClient):
         """Test stripping plain ``` fences."""
         content = '```\n{"issues": []}\n```'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
     def test_no_fences(self, client: OllamaClient):
         """Test content without fences is unchanged."""
         content = '{"issues": []}'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
 
