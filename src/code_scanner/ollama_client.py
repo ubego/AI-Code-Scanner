@@ -2,15 +2,20 @@
 
 import json
 import logging
-import re
-import time
 import urllib.error
 import urllib.request
 from typing import Any, Optional
 
-from .base_client import BaseLLMClient, LLMClientError, ContextOverflowError, RequestBuilder
-from .models import LLMConfig
-from .error_messages import OllamaErrors, GeneralErrors
+from .base_client import (
+    BaseLLMClient, LLMClientError, ContextOverflowError, RequestBuilder,
+    StreamAccumulator, JSON_FIX_SYSTEM_PROMPT,
+)
+from .models import LLMConfig, LLMToolCallResponse
+from .stream_validator import (
+    RunawayGenerationError,
+    ResponseSizeExceededError,
+)
+from .error_messages import OllamaErrors
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +31,10 @@ class OllamaClient(BaseLLMClient):
         Args:
             config: LLM configuration with host, port, model, etc.
         """
+        super().__init__()
         self.config = config
-        self._context_limit: Optional[int] = None
-        self._model_id: Optional[str] = None
         self._connected: bool = False
-        self._model_context_limit: Optional[int] = None  # Actual limit from model
+        self._model_context_limit: Optional[int] = None
 
     @property
     def backend_name(self) -> str:
@@ -38,11 +42,7 @@ class OllamaClient(BaseLLMClient):
         return "Ollama"
 
     def is_connected(self) -> bool:
-        """Check if client is connected.
-
-        Returns:
-            True if connected, False otherwise.
-        """
+        """Check if client is connected."""
         return self._connected
 
     def connect(self) -> None:
@@ -184,28 +184,6 @@ class OllamaClient(BaseLLMClient):
         
         return None
 
-    @property
-    def context_limit(self) -> int:
-        """Get the context limit in tokens.
-
-        Raises:
-            LLMClientError: If not connected or limit unavailable.
-        """
-        if self._context_limit is None:
-            raise LLMClientError(OllamaErrors.NOT_CONNECTED_OR_NO_CONTEXT)
-        return self._context_limit
-
-    @property
-    def model_id(self) -> str:
-        """Get the model ID being used.
-
-        Raises:
-            LLMClientError: If not connected.
-        """
-        if self._model_id is None:
-            raise LLMClientError(OllamaErrors.NOT_CONNECTED)
-        return self._model_id
-
     def query(
         self,
         system_prompt: str,
@@ -250,6 +228,7 @@ class OllamaClient(BaseLLMClient):
                     tools=tools,
                     context_limit=self._context_limit,
                 )
+                request_data["stream"] = True
 
                 url = f"{self.config.base_url}/api/chat"
                 req = urllib.request.Request(
@@ -259,22 +238,52 @@ class OllamaClient(BaseLLMClient):
                     method="POST"
                 )
 
+                acc = StreamAccumulator()
+                tool_calls_raw: list[dict] = []
+                final_message: dict = {}
+
                 with urllib.request.urlopen(req, timeout=self.config.timeout) as response:
-                    data = json.loads(response.read().decode())
+                    for line_bytes in response:
+                        line = line_bytes.decode("utf-8").strip()
+                        if not line:
+                            continue
+                        try:
+                            chunk_data = json.loads(line)
+                        except json.JSONDecodeError:
+                            logger.debug("Skipping unparseable streaming chunk: %s", line[:100])
+                            continue
 
-                # Check if Ollama wants to call tools
-                message = data.get("message", {})
-                if tools and message.get("tool_calls"):
-                    tool_calls = []
-                    for tool_call in message["tool_calls"]:
-                        tool_calls.append({
-                            "tool_name": tool_call["function"]["name"],
-                            "arguments": tool_call["function"]["arguments"],
-                        })
-                    logger.info(f"Ollama requested {len(tool_calls)} tool call(s)")
-                    return {"tool_calls": tool_calls}
+                        message = chunk_data.get("message", {})
+                        content_delta = message.get("content", "")
+                        acc.feed(content_delta)
 
-                content = message.get("content", "")
+                        if chunk_data.get("done"):
+                            final_message = message
+                            if tools and message.get("tool_calls"):
+                                for tc in message["tool_calls"]:
+                                    tool_calls_raw.append({
+                                        "tool_name": tc["function"]["name"],
+                                        "arguments": tc["function"]["arguments"],
+                                    })
+                            break
+
+                if tools and tool_calls_raw:
+                    logger.info(f"Ollama requested {len(tool_calls_raw)} tool call(s)")
+                    try:
+                        validated = LLMToolCallResponse.model_validate({"tool_calls": tool_calls_raw})
+                        return validated.model_dump()
+                    except Exception as e:
+                        logger.warning(
+                            f"Ollama returned malformed tool calls (attempt {attempt + 1}/{max_retries}): {e}. "
+                            "Will retry to get corrected response."
+                        )
+                        last_raw_response = f"Malformed tool calls: {e}"
+                        continue
+
+                content = acc.content
+                if not content:
+                    # Some Ollama models put final content only in the "done" chunk
+                    content = final_message.get("content", "")
                 if not content:
                     logger.warning(
                         f"Empty response from Ollama (attempt {attempt + 1}/{max_retries}). "
@@ -282,32 +291,13 @@ class OllamaClient(BaseLLMClient):
                     )
                     continue
 
-                # Strip markdown code fences if present
-                content = self._strip_markdown_fences(content)
-
-                # Parse JSON response
-                try:
-                    result = json.loads(content)
+                content = self.strip_markdown_fences(content)
+                parsed = self._parse_and_fix_json_response(content, attempt, max_retries)
+                if parsed is not None:
                     logger.debug("Successfully parsed JSON response")
-                    return result
-                except json.JSONDecodeError as e:
-                    # This is normal - LLMs sometimes return non-JSON. Auto-fix will handle it.
-                    last_raw_response = content if content else "(empty)"
-                    raw_preview = content[:500] if content else "(empty)"
-                    logger.info(
-                        f"LLM returned non-JSON response (attempt {attempt + 1}/{max_retries}). "
-                        f"This is normal and will be auto-corrected.\n"
-                        f"Parse error: {e}"
-                    )
-                    logger.debug(f"--- Raw response ---\n{raw_preview}\n--- End raw response ---")
-                    
-                    # Try to get LLM to fix its own response
-                    fix_result = self._try_fix_json_response(content)
-                    if fix_result is not None:
-                        logger.info("Ollama successfully reformatted response to valid JSON.")
-                        return fix_result
-                    
-                    continue
+                    return parsed
+                last_raw_response = content if content else "(empty)"
+                continue
 
             except urllib.error.HTTPError as e:
                 error_body = e.read().decode() if e.fp else str(e)
@@ -330,6 +320,13 @@ class OllamaClient(BaseLLMClient):
                     )
                 
                 logger.warning(f"Ollama HTTP error (attempt {attempt + 1}): {e}")
+                continue
+
+            except (RunawayGenerationError, ResponseSizeExceededError) as e:
+                logger.warning(
+                    f"Ollama response issue (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+                last_raw_response = str(e)[:1000]
                 continue
 
             except urllib.error.URLError as e:
@@ -383,14 +380,7 @@ class OllamaClient(BaseLLMClient):
                 "messages": [
                     {
                         "role": "system",
-                        "content": (
-                            "You are a JSON extractor. Extract and return ONLY valid JSON. "
-                            "Do NOT include markdown code fences (```), explanations, or any other text. "
-                            "Output ONLY the raw JSON object, nothing else. "
-                            "Expected format: {\"issues\": [{\"file\": \"...\", \"line_number\": N, "
-                            "\"description\": \"...\", \"suggested_fix\": \"...\", \"code_snippet\": \"...\"}]} "
-                            "If the input has no valid issues, return: {\"issues\": []}"
-                        )
+                        "content": JSON_FIX_SYSTEM_PROMPT,
                     },
                     {
                         "role": "user",
@@ -419,7 +409,7 @@ class OllamaClient(BaseLLMClient):
                 content = data.get("message", {}).get("content", "")
 
             if content:
-                content = self._strip_markdown_fences(content)
+                content = self.strip_markdown_fences(content)
                 result = json.loads(content)
                 return result
 
@@ -427,62 +417,3 @@ class OllamaClient(BaseLLMClient):
             logger.debug(f"JSON fix attempt failed: {e}")
 
         return None
-
-    def _strip_markdown_fences(self, content: str) -> str:
-        """Strip markdown code fences from content.
-
-        Args:
-            content: Raw response content.
-
-        Returns:
-            Content with markdown fences stripped.
-        """
-        content = content.strip()
-
-        # Pattern to match ```json or ``` at start and ``` at end
-        fence_pattern = re.compile(
-            r'^```(?:json)?\s*\n?(.*?)\n?```\s*$',
-            re.DOTALL | re.IGNORECASE
-        )
-
-        match = fence_pattern.match(content)
-        if match:
-            return match.group(1).strip()
-
-        return content
-
-    def wait_for_connection(self, retry_interval: int = 10) -> None:
-        """Wait for Ollama to become available.
-
-        Retries connection every `retry_interval` seconds until successful.
-
-        Args:
-            retry_interval: Seconds between retry attempts.
-        """
-        logger.info("Waiting for Ollama connection...")
-
-        while True:
-            try:
-                self.connect()
-                logger.info("Ollama connection restored")
-                return
-            except LLMClientError as e:
-                logger.warning(f"Connection failed: {e}")
-                logger.info(f"Retrying in {retry_interval} seconds...")
-                time.sleep(retry_interval)
-
-
-
-    def set_context_limit(self, limit: int) -> None:
-        """Manually set the context limit.
-
-        Args:
-            limit: Context limit in tokens.
-
-        Raises:
-            ValueError: If limit is not positive.
-        """
-        if limit <= 0:
-            raise ValueError(GeneralErrors.CONTEXT_LIMIT_MUST_BE_POSITIVE)
-        self._context_limit = limit
-        logger.info(f"Context limit manually set to: {limit} tokens")

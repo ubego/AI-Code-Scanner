@@ -1,13 +1,14 @@
 #!/bin/bash
 # Code Scanner Autostart Management - macOS (LaunchAgents)
 # Usage: ./autostart-macos.sh [install|remove|status] "<cli_command>"
-# Example: ./autostart-macos.sh install "/path/to/project1 -c /path/to/config1 /path/to/project2 -c /path/to/config2"
+# Example: ./autostart-macos.sh install "/path/to/project1 -c /path/to/config1 /path/to/project2 -c /path/to/config2 --mode branch"
 
 set -e
 
 SERVICE_NAME="com.code-scanner"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST_FILE="$LAUNCH_AGENTS_DIR/$SERVICE_NAME.plist"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Colors for output
 RED='\033[0;31m'
@@ -20,6 +21,91 @@ print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Resolve the GNU coreutils timeout command. Stock macOS does NOT ship
+# `timeout`; it is available as `gtimeout` via `brew install coreutils`.
+# Echoes the command name (and returns 0), or returns 1 if unavailable.
+resolve_timeout() {
+    if command -v gtimeout &> /dev/null; then
+        echo "gtimeout"
+        return 0
+    elif command -v timeout &> /dev/null; then
+        echo "timeout"
+        return 0
+    fi
+    return 1
+}
+
+reinstall_from_source() {
+    if [[ ! -f "$PROJECT_ROOT/pyproject.toml" ]]; then
+        print_warning "No pyproject.toml found at $PROJECT_ROOT. Skipping reinstall."
+        return 1
+    fi
+
+    print_info "Reinstalling code-scanner from source: $PROJECT_ROOT"
+
+    # The on-PATH binary is typically pipx-managed. Prefer pipx so the
+    # installed entry point is actually updated. Fall back to uv/pip if needed.
+    if command -v pipx &> /dev/null; then
+        pipx install --force "$PROJECT_ROOT" 2>&1
+        local rc=$?
+    elif command -v uv &> /dev/null; then
+        print_warning "pipx not found; falling back to 'uv pip install' into the active environment."
+        uv pip install "$PROJECT_ROOT" 2>&1
+        local rc=$?
+    elif command -v pip3 &> /dev/null; then
+        print_warning "Neither pipx nor uv found; falling back to 'pip3 install'."
+        pip3 install --user "$PROJECT_ROOT" 2>&1
+        local rc=$?
+    else
+        print_error "Could not find pipx, uv, or pip3 to reinstall code-scanner."
+        return 1
+    fi
+
+    if [[ $rc -ne 0 ]]; then
+        print_error "Failed to reinstall code-scanner from source (exit code $rc)."
+        return 1
+    fi
+
+    local new_version
+    new_version=$(code-scanner --version 2>/dev/null || echo "unknown")
+    print_success "Reinstalled code-scanner: $new_version"
+    return 0
+}
+
+# Detect whether the installed binary supports a required flag by scanning
+# its --help output. Returns 0 (supported) or 1 (not supported / no binary).
+supports_flag() {
+    local flag="$1"
+    command -v code-scanner &> /dev/null || return 1
+    code-scanner --help 2>&1 | grep -q -- "$flag"
+}
+
+# Verify the installed binary actually supports every long flag in cli_args.
+# Emits a precise diagnostic when a flag is unsupported (stale install).
+verify_cli_compatibility() {
+    local cli_args="$1"
+    local missing=()
+
+    while read -r flag; do
+        [[ -z "$flag" ]] && continue
+        if ! supports_flag "$flag"; then
+            missing+=("$flag")
+        fi
+    done < <(echo "$cli_args" | grep -oE -- '--[a-z][a-z0-9-]*' | sort -u)
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo ""
+        print_error "Installed code-scanner does not support: ${missing[*]}"
+        print_error "This usually means the installed binary is older than the source."
+        print_error "Source: $PROJECT_ROOT"
+        print_error "Re-install from source, for example:"
+        print_error "  pipx install --force \"$PROJECT_ROOT\""
+        return 1
+    fi
+
+    return 0
+}
 
 show_installed_info() {
     if command -v code-scanner &> /dev/null; then
@@ -58,7 +144,7 @@ usage() {
     echo "  status                      Check service status"
     echo ""
     echo "Examples:"
-    echo "  $0 install \"/path/to/project1 -c /path/to/config1 /path/to/project2 -c /path/to/config2\""
+    echo "  $0 install \"/path/to/project1 -c /path/to/config1 /path/to/project2 -c /path/to/config2 --mode branch\""
     echo "  $0 remove"
     echo "  $0 status"
     exit 1
@@ -84,9 +170,17 @@ test_launch() {
     print_info "Command: $scanner_cmd $cli_args"
     echo ""
 
+    # Resolve a timeout command (macOS ships gtimeout via coreutils, not timeout).
+    local timeout_cmd
+    if ! timeout_cmd=$(resolve_timeout); then
+        print_warning "Neither 'gtimeout' nor 'timeout' found ('brew install coreutils' provides gtimeout)."
+        print_warning "Skipping automated test launch; please verify the command runs manually."
+        return 0
+    fi
+
     # Run for 5 seconds, capture output
     local output
-    output=$(timeout 5s $scanner_cmd $cli_args 2>&1 | head -30) || true
+    output=$($timeout_cmd 5s $scanner_cmd $cli_args 2>&1 | head -30) || true
 
     echo "$output"
     echo ""
@@ -158,6 +252,16 @@ install_service() {
     # Find code-scanner
     local scanner_cmd
     scanner_cmd=$(find_code_scanner)
+
+    # Reinstall from source first, so the on-PATH binary matches the source
+    # (the install otherwise launches whatever stale binary is present).
+    # Non-fatal: if reinstall fails we still verify compatibility below.
+    reinstall_from_source || print_warning "Reinstall skipped or failed; continuing with the current binary."
+
+    # Verify the installed binary supports every flag in the command.
+    if ! verify_cli_compatibility "$cli_args"; then
+        exit 1
+    fi
 
     # Test launch first
     test_launch "$scanner_cmd" "$cli_args"

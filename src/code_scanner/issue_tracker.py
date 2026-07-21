@@ -2,8 +2,10 @@
 
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 
 from .models import Issue, IssueStatus
+from .text_utils import code_snippet_still_present
 
 logger = logging.getLogger(__name__)
 
@@ -127,39 +129,60 @@ class IssueTracker:
                 new_count += 1
         return new_count
 
-    def resolve_issues_for_file(self, file_path: str) -> int:
+    def resolve_issues_for_file(
+        self, file_path: str, file_content: Optional[str] = None
+    ) -> int:
         """Mark all open issues for a file as resolved.
 
         Used when a file is deleted or when issues are no longer detected.
 
+        When ``file_content`` is provided, an issue is only resolved if its
+        ``code_snippet`` is actually gone from the file (steady resolution).
+        Issues whose code is still present are kept OPEN to avoid LLM
+        non-determinism wrongly marking them resolved. If presence cannot be
+        determined (no snippet / no content), the legacy behavior is used.
+
         Args:
             file_path: Path to the file.
+            file_content: Current content of the file, if available.
 
         Returns:
             Number of issues resolved.
         """
         # O(1) file lookup instead of O(n) full list iteration
         open_issues = self._open_by_file.get(file_path, [])
-        resolved_count = len(open_issues)
-        
+        to_resolve: list[Issue] = []
+        retained: list[Issue] = []
+
         for issue in open_issues:
+            still_present = code_snippet_still_present(issue.code_snippet, file_content)
+            if still_present is True:
+                retained.append(issue)
+                logger.info(
+                    f"Retained open - code still present: {file_path}:{issue.line_number}"
+                )
+            else:
+                to_resolve.append(issue)
+
+        for issue in to_resolve:
             issue.status = IssueStatus.RESOLVED
             self._changed = True
             logger.info(f"Resolved issue: {file_path}:{issue.line_number}")
-        
-        # Move all issues from open to resolved index
-        if resolved_count > 0:
+
+        # Move resolved issues from open to resolved index; keep retained ones open.
+        if to_resolve:
             if file_path not in self._resolved_by_file:
                 self._resolved_by_file[file_path] = []
-            self._resolved_by_file[file_path].extend(open_issues)
-            self._open_by_file[file_path] = []
-        
-        return resolved_count
+            self._resolved_by_file[file_path].extend(to_resolve)
+            self._open_by_file[file_path] = retained
+
+        return len(to_resolve)
 
     def update_from_scan(
         self,
         new_issues: list[Issue],
         scanned_files: list[str],
+        files_content: Optional[dict[str, str]] = None,
     ) -> tuple[int, int]:
         """Update tracker from a scan result.
 
@@ -170,17 +193,25 @@ class IssueTracker:
         This prevents LLM non-determinism from incorrectly resolving issues
         when file content hasn't actually changed.
 
+        When ``files_content`` is provided, resolution is additionally gated on
+        the issue's ``code_snippet`` actually being gone from the file (steady
+        resolution): an issue whose code is still present is never resolved by
+        mere non-detection.
+
         Args:
             new_issues: Issues detected in this scan.
             scanned_files: List of files that were actually scanned/changed.
                           Only these files will have issues resolved.
+            files_content: Optional mapping of file path to current content,
+                           used to verify issue code snippets are gone before
+                           resolving.
 
         Returns:
             Tuple of (new_issues_count, resolved_count).
         """
         # Convert to set for O(1) lookup
         scanned_files_set = set(scanned_files)
-        
+
         # Group new issues by file
         new_by_file: dict[str, list[Issue]] = {}
         for issue in new_issues:
@@ -192,13 +223,17 @@ class IssueTracker:
         resolved_count = 0
         for file_path in scanned_files:
             if file_path not in new_by_file:
-                resolved_count += self.resolve_issues_for_file(file_path)
+                file_content = files_content.get(file_path) if files_content else None
+                resolved_count += self.resolve_issues_for_file(file_path, file_content)
 
         # For files with new issues that were actually scanned, resolve old issues that don't match
         # IMPORTANT: Only resolve for files in scanned_files to avoid LLM non-determinism issues
         for file_path, file_issues in new_by_file.items():
             if file_path in scanned_files_set:
-                resolved_count += self._resolve_non_matching(file_path, file_issues)
+                file_content = files_content.get(file_path) if files_content else None
+                resolved_count += self._resolve_non_matching(
+                    file_path, file_issues, file_content
+                )
 
         # Add new issues (all issues, not just for scanned files - new issues are always valid)
         new_count = self.add_issues(new_issues)
@@ -209,32 +244,48 @@ class IssueTracker:
         self,
         file_path: str,
         current_issues: list[Issue],
+        file_content: Optional[str] = None,
     ) -> int:
         """Resolve open issues that don't match any current issues.
+
+        When ``file_content`` is provided, an issue is only resolved if its
+        ``code_snippet`` is actually gone from the file (steady resolution):
+        issues whose code is still present are kept OPEN even when the LLM did
+        not re-report them. If presence cannot be determined, the legacy
+        behavior (resolve on non-detection) is used.
 
         Args:
             file_path: Path to the file.
             current_issues: Currently detected issues for this file.
+            file_content: Current content of the file, if available.
 
         Returns:
             Number of issues resolved.
         """
         resolved_count = 0
         to_resolve: list[Issue] = []
-        
+
         # O(1) file lookup instead of O(n) full list iteration
         for existing in self._open_by_file.get(file_path, []):
             # Check if any current issue matches
             matches = any(existing.matches(curr) for curr in current_issues)
-            if not matches:
-                to_resolve.append(existing)
-        
+            if matches:
+                continue
+            # Steady resolution: keep OPEN if the code is still in the file.
+            still_present = code_snippet_still_present(existing.code_snippet, file_content)
+            if still_present is True:
+                logger.info(
+                    f"Retained open - code still present: {file_path}:{existing.line_number}"
+                )
+                continue
+            to_resolve.append(existing)
+
         # Resolve and move to resolved index using helper
         for issue in to_resolve:
             self._move_issue_status(issue, IssueStatus.OPEN, IssueStatus.RESOLVED)
             resolved_count += 1
             logger.info(f"Resolved (fixed): {file_path}:{issue.line_number}")
-        
+
         return resolved_count
 
     def get_issues_by_file(self) -> dict[str, list[Issue]]:

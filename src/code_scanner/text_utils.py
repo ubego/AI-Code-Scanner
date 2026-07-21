@@ -99,6 +99,53 @@ def normalize_whitespace(text: str) -> str:
     return " ".join(text.split())
 
 
+def code_snippet_still_present(
+    snippet: str,
+    file_content: Optional[str],
+    threshold: float = 85.0,
+) -> Optional[bool]:
+    """Check whether an issue's code snippet is still in the file content.
+
+    Used to make issue resolution "steady": an issue is only auto-resolved
+    by LLM non-detection when its own problematic code is actually gone from
+    the file. This prevents LLM non-determinism from marking still-present
+    issues as resolved.
+
+    Comparison is whitespace-insensitive (both sides are normalized) and uses
+    ``rapidfuzz.fuzz.partial_ratio`` so a snippet still matches when embedded
+    anywhere in the file (e.g. a 2-line snippet inside a longer file).
+
+    Args:
+        snippet: The issue's ``code_snippet`` (problematic code).
+        file_content: Current file content, or None if unavailable.
+        threshold: Minimum ``partial_ratio`` score (0-100) to consider the
+                   snippet present. Default 85.
+
+    Returns:
+        True if the snippet is still present in the file (keep issue OPEN),
+        False if it is not found (legitimate fix, OK to resolve),
+        None if it cannot be determined (empty snippet or missing file
+        content) — callers should fall back to legacy behavior.
+    """
+    # Cannot determine presence without a snippet to look for.
+    if not snippet or not snippet.strip():
+        return None
+    # Cannot determine presence without file content to search in.
+    if not file_content:
+        return None
+
+    norm_snippet = normalize_whitespace(snippet)
+    norm_content = normalize_whitespace(file_content)
+
+    # Re-check after normalization: pure-whitespace snippets resolve to "".
+    if not norm_snippet:
+        return None
+
+    from rapidfuzz import fuzz
+    score = fuzz.partial_ratio(norm_snippet, norm_content)
+    return score >= threshold
+
+
 def truncate_output(
     content: str,
     max_lines: int = MAX_OUTPUT_LINES,

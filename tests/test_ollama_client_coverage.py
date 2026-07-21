@@ -6,6 +6,21 @@ import urllib.error
 from code_scanner.ollama_client import OllamaClient, LLMClientError, ContextOverflowError
 from code_scanner.models import LLMConfig
 
+
+def _make_ollama_stream_response(content: str) -> list[bytes]:
+    """Build a streaming Ollama response from final content."""
+    lines: list[bytes] = []
+    chunk_size = max(1, len(content) // 4) if content else 10
+    for i in range(0, len(content), chunk_size):
+        piece = content[i:i + chunk_size]
+        lines.append(
+            json.dumps({"message": {"content": piece}, "done": False}).encode() + b"\n"
+        )
+    lines.append(
+        json.dumps({"message": {"content": ""}, "done": True}).encode() + b"\n"
+    )
+    return lines
+
 class TestOllamaClientCoverage:
     """Additional tests for OllamaClient execution coverage."""
 
@@ -65,7 +80,7 @@ class TestOllamaClientCoverage:
         client3.connect()
         assert client3.context_limit == 1024
 
-    @patch("code_scanner.ollama_client.time.sleep")
+    @patch("code_scanner.base_client.time.sleep")
     @patch("code_scanner.ollama_client.urllib.request.urlopen")
     def test_wait_for_connection(self, mock_urlopen, mock_sleep, ollama_config):
         """Test wait_for_connection re-tries."""
@@ -98,15 +113,14 @@ class TestOllamaClientCoverage:
         client._model_id = "llama3"
         client._context_limit = 4096
 
-        # 1. Malformed response
+        # 1. Malformed response (streaming — first call)
+        malformed_lines = _make_ollama_stream_response("Here is the code: {issues: []")
         malformed_resp = MagicMock()
-        malformed_resp.read.return_value = json.dumps({
-            "message": {"content": "Here is the code: {issues: []"} # invalid json
-        }).encode()
+        malformed_resp.__iter__ = MagicMock(return_value=iter(malformed_lines))
         malformed_resp.__enter__ = MagicMock(return_value=malformed_resp)
         malformed_resp.__exit__ = MagicMock(return_value=False)
 
-        # 2. Fix response from LLM
+        # 2. Fix response from LLM (non-streaming — uses .read())
         fixed_resp = MagicMock()
         fixed_resp.read.return_value = json.dumps({
             "message": {"content": "{\"issues\": []}"}
@@ -181,9 +195,9 @@ class TestOllamaClientCoverage:
         client._connected = True
         client._model_id = "llama3"
         
-        # side_effect: Timeout, then valid response
+        valid_lines = _make_ollama_stream_response("{}")
         valid_resp = MagicMock()
-        valid_resp.read.return_value = json.dumps({"message": {"content": "{}"}}).encode()
+        valid_resp.__iter__ = MagicMock(return_value=iter(valid_lines))
         valid_resp.__enter__ = MagicMock(return_value=valid_resp)
         valid_resp.__exit__ = MagicMock(return_value=False)
         
@@ -191,7 +205,6 @@ class TestOllamaClientCoverage:
         
         result = client.query("sys", "user")
         assert result == {}
-        # Should have verified log warning about timeout, but basic execution is enough
 
     @patch("code_scanner.ollama_client.urllib.request.urlopen")
     def test_query_fix_failure(self, mock_urlopen, ollama_config):
@@ -200,15 +213,13 @@ class TestOllamaClientCoverage:
         client._connected = True
         client._model_id = "llama3"
         
-        # Malformed response
+        malformed_lines = _make_ollama_stream_response("INVALID")
         malformed_resp = MagicMock()
-        malformed_resp.read.return_value = json.dumps({
-            "message": {"content": "INVALID"}
-        }).encode()
+        malformed_resp.__iter__ = MagicMock(return_value=iter(malformed_lines))
         malformed_resp.__enter__ = MagicMock(return_value=malformed_resp)
         malformed_resp.__exit__ = MagicMock(return_value=False)
         
-        # Malformed fix response (fails to fix)
+        # Fix response still uses non-streaming (.read())
         malformed_fix_resp = MagicMock()
         malformed_fix_resp.read.return_value = json.dumps({
             "message": {"content": "STILL INVALID"}
@@ -216,15 +227,12 @@ class TestOllamaClientCoverage:
         malformed_fix_resp.__enter__ = MagicMock(return_value=malformed_fix_resp)
         malformed_fix_resp.__exit__ = MagicMock(return_value=False)
         
-        # Mock for 3 retries, each failing + failing fix
-        # Sequence: Query1 -> Fail, Fix1 -> Fail, Query2 -> Fail, Fix2 -> Fail, Query3 -> Fail, Fix3 -> Fail
         mock_urlopen.side_effect = [
             malformed_resp, malformed_fix_resp,
             malformed_resp, malformed_fix_resp,
             malformed_resp, malformed_fix_resp
         ]
         
-        # Should raise LLMClientError after retries exhausted
         with pytest.raises(LLMClientError) as exc_info:
             client.query("sys", "user", max_retries=3)
             
@@ -237,26 +245,31 @@ class TestOllamaClientCoverage:
         client._connected = True
         client._model_id = "llama3"
         
-        # Response with tool_calls
-        tool_response = MagicMock()
-        tool_response.read.return_value = json.dumps({
-            "message": {
-                "tool_calls": [
-                    {
-                        "function": {
-                            "name": "search_text",
-                            "arguments": {"patterns": ["test"]}
+        tool_lines = [
+            json.dumps({"message": {"content": ""}, "done": False}).encode() + b"\n",
+            json.dumps({
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "search_text",
+                                "arguments": {"patterns": ["test"]},
+                            }
                         }
-                    }
-                ]
-            }
-        }).encode()
+                    ],
+                },
+                "done": True,
+            }).encode() + b"\n",
+        ]
+        
+        tool_response = MagicMock()
+        tool_response.__iter__ = MagicMock(return_value=iter(tool_lines))
         tool_response.__enter__ = MagicMock(return_value=tool_response)
         tool_response.__exit__ = MagicMock(return_value=False)
         
         mock_urlopen.return_value = tool_response
         
-        # Provide tools
         tools = [{"type": "function", "function": {"name": "search_text"}}]
         result = client.query("sys", "user", tools=tools)
         

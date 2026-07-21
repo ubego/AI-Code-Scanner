@@ -266,9 +266,9 @@ code-scanner X.Y.Z
 
 ### Platform-Specific Setup
 
-For detailed setup instructions including autostart configuration:
+For detailed setup instructions including autostart configuration (background service via systemd / LaunchAgent / Task Scheduler):
 
-- **[Linux Setup](docs/linux-setup.md)** - systemd service, desktop integration
+- **[Linux Setup](docs/linux-setup.md)** - systemd user service
 - **[macOS Setup](docs/macos-setup.md)** - LaunchAgent, Homebrew setup
 - **[Windows Setup](docs/windows-setup.md)** - Task Scheduler, Chocolatey/Scoop installation
 
@@ -502,9 +502,9 @@ Start-Process -WindowStyle Hidden code-scanner -ArgumentList "/path/to/project"
 
 ### Autostart on Boot
 
-Run Code Scanner automatically when your system starts:
+Run Code Scanner automatically when your system starts. Pass the **full CLI command** (the same arguments you would pass to `code-scanner`) as a single quoted argument:
 
-The `install` command automatically reinstalls code-scanner from the project source before configuring the service, ensuring the latest version is always deployed.
+The `install` command automatically reinstalls code-scanner from the project source before configuring the service (preferring **pipx**, falling back to `uv`/`pip`), ensuring the latest version is always deployed. It also verifies the installed binary supports every flag in your command and prints a clear diagnostic if the install is stale.
 
 **Linux:**
 ```bash
@@ -519,6 +519,12 @@ The `install` command automatically reinstalls code-scanner from the project sou
 **Windows:**
 ```batch
 scripts\autostart-windows.bat install "/path/to/project -c /path/to/config.toml"
+```
+
+Multiple projects and modes are supported — the quoted string is exactly the `code-scanner` CLI:
+
+```bash
+./scripts/autostart-linux.sh install "/path/to/project1 -c /path/to/config1.toml /path/to/project2 -c /path/to/config2.toml --mode branch"
 ```
 
 See platform-specific setup docs for details.
@@ -854,13 +860,21 @@ git commit -m "Initial commit"
 
 #### "Malformed JSON response" errors
 
-**Problem:** LLM returns invalid JSON
+**Problem:** LLM returns invalid JSON, or its output is cut off mid-generation (`max_tokens` hit, dropped stream).
 
-**Solutions:**
-1. Scanner automatically retries (up to 3 times)
-2. Try a different model
-3. Reduce `context_limit` to prevent overflow
-4. Simplify check prompts
+**What the scanner does automatically:**
+
+1. **Markdown fence stripping** — removes ```` ```json ```` wrappers (including the truncated case where the closing fence never arrived).
+2. **Local truncation recovery** — if the JSON was cut off mid-object, the scanner repairs it locally by dropping the incomplete tail and closing open braces. This avoids a second LLM round-trip and recovers whatever complete issues the model had already produced.
+3. **LLM reformat request** — if local recovery doesn't apply (e.g. the model returned prose instead of JSON), the scanner asks the LLM to reformat its own output.
+4. **Retries** — up to 3 attempts before skipping the check and logging an error.
+
+**If these errors persist frequently:**
+
+1. Try a different model
+2. Reduce `context_limit` to prevent overflow
+3. Simplify check prompts
+4. Increase `max_tokens` if the model is hitting the output cap (the scanner hard-caps output tokens to avoid runaway generation; for reasoning models this is rarely the bottleneck)
 
 #### Lock file errors
 

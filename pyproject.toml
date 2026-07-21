@@ -23,6 +23,7 @@ classifiers = [
 
 dependencies = [
     "openai>=1.0.0",     # Used for OpenAI-compatible API client (LM Studio)
+    "httpx>=0.27.0",     # Direct HTTP client for streaming/timeout exceptions in LLM clients
     "gitpython>=3.1.0",
     "pathspec>=0.11.0",  # For efficient gitignore pattern matching
     "rapidfuzz>=3.0.0",  # For fast fuzzy string matching

@@ -38,7 +38,7 @@ checks = [
     "Check that blocking operations are not performed on the main GUI thread.",
     "Check that worker threads have an event loop when needed.",
     # Memory and resource checks
-    "Check that stack allocation is preferred over heap allocation for small, short-lived objects.",
+    "Check that stack allocation is used instead of heap allocation when an object's lifetime is predetermined",
     "Check that QObjects have a parent in non-obvious ownership scenarios.",
     "Check that Qt's parent-child memory management is used instead of manual management.",
     "Check that QSharedPointer or QScopedPointer is used for non-QObject resources.",

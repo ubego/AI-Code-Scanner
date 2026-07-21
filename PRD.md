@@ -5,7 +5,7 @@
 The primary objective of this project is to implement a software program that **scans a target source code directory** using a separate application to identify potential issues or answer specific user-defined questions.
 
 *   **Core Value Proposition:** Provide developers with an automated, **language-agnostic** background scanner that identifies "undefined behavior," code style inconsistencies, optimization opportunities, and architectural violations (e.g., broken MVC patterns).
-*   **Quality Assurance:** The codebase maintains **99% test coverage** with 963 unit tests ensuring reliability and maintainability.
+*   **Quality Assurance:** The codebase maintains comprehensive test coverage with 1208 unit tests ensuring reliability and maintainability.
 *   **Target Scope:** The application focuses on **uncommitted changes** in a Git branch by default, ensuring immediate feedback for developer before code is finalized.
 *   **Directory Scope:** The scanner can monitor **multiple directories (projects) simultaneously** with automatic project switching based on most recent changes. Each directory is scanned **recursively** (all subdirectories).
 *   **Git Requirement:** The target directory **must be a Git repository**. The scanner will fail with an error if Git is not initialized.
@@ -25,6 +25,9 @@ The primary objective of this project is to implement a software program that **
     *   **ripgrep** - For fast code search (used by AI tools)
 *   **Uninteractive Daemon Mode:** The scanner is designed for **fully uninteractive daemon operation**. No interactive prompts are used—all configuration must be provided via a config file. This enables running as a system service or background process.
 *   **Continuous Scanning by Default:** The scanner runs in continuous monitoring mode automatically—there is no separate "watch mode" flag. Once started, it monitors for changes and scans indefinitely until manually stopped (`Ctrl+C`).
+*   **Operation Mode (`--mode` / `-m`):** The `--mode` flag selects **which set of changes** the scanner analyzes, not whether it watches:
+    *   `uncommitted` (default) — scans working-tree changes since the last commit. Best for real-time feedback as you code.
+    *   `branch` — scans all changes in the current branch since it diverged from `main`/`master` (committed + uncommitted). Useful for reviewing an entire feature branch before merging.
 *   **Passive Operation:** The scanner operates as a **passive background tool** that only reports issues to a log file. It does **not** modify any source files in the target directory.
 *   **Success Criteria:** 
     *   Ability to accurately identify issues based on user-provided queries in a configuration file.
@@ -47,7 +50,12 @@ The primary objective of this project is to implement a software program that **
 *   **Whole File Analysis:** When a file is modified, the scanner analyzes the **entire file content**, not just the diff/changed lines, to ensure full context is available for AI.
 *   **Specific Commit Analysis:** Users must have the option to scan changes **relative to a specific commit hash** (similar to `git reset --soft <hash>`). This allows scanning cumulative changes against a parent branch. After the initial scan, the application continues to monitor for new changes relative to that base.
 *   **Untracked Files:** Untracked files are **still included** in commit-relative mode, regardless of the specified commit.
-*   **Rebase/Merge Conflict Handling:** If a rebase or merge with conflict resolution is in progress (detected via `.git/MERGE_HEAD`, `.git/REBASE_HEAD`, or similar), the scanner must **wait for completion** before launching new scans. Poll for resolution status during the wait state.
+*   **Rebase/Merge Conflict Handling:** If a rebase or merge with conflict resolution is in progress, the scanner must **wait for completion** before launching new scans on that project.
+    *   **Detection:** Merge/rebase state is detected by checking `git status --porcelain=v2` output for unmerged (`u`) entries, validated against on-disk marker files (`.git/MERGE_HEAD`, `.git/REBASE_HEAD`, `rebase-merge/`, `rebase-apply/`). Both conditions must be true to avoid false positives from stale marker files.
+    *   **Active Project Only:** Merge/rebase detection is only performed for the **currently active project** being scanned. Non-active projects are checked for file changes only (merge/rebase state is ignored during activity comparison).
+    *   **Logging:** When merge/rebase is detected, the scanner logs the event with the **project name** (directory name) for clear identification. Repeated log messages are suppressed while the conflict persists.
+    *   **Multi-Project Behavior:** In multi-project mode, when the active project enters merge/rebase state, the scanner **temporarily switches to another eligible project** with uncommitted changes. The original project is revisited once the conflict is resolved (merge/rebase markers cleared).
+    *   **Single-Project Behavior:** In single-project mode, the scanner polls for conflict resolution and resumes scanning automatically once the merge/rebase is complete.
 *   **Monitoring Loop:** The application will run in a continuous loop, polling every **30 seconds** for new updates when idle. When files change during a scan, the scanner uses a **watermark algorithm** for efficient rescanning:
     1.  Each check is executed with the **latest file content** fetched at scan time.
     2.  If files change at check index N, checks N+1 onwards already used fresh content.
@@ -115,23 +123,46 @@ The primary objective of this project is to implement a software program that **
 *   **Model Selection:**
     *   **LM Studio:** Use the **first/default model** available. No explicit model selection required.
     *   **Ollama:** Model specification is **required** in config (e.g., `model = "qwen3:4b"`).
-*   **Client Architecture:** Both `LMStudioClient` and `OllamaClient` must implement a common **abstract base class** (`BaseLLMClient`) to ensure interchangeable usage by the Scanner.
+*   **Client Architecture:** Both `LMStudioClient` and `OllamaClient` implement a common **abstract base class** (`BaseLLMClient`) to ensure interchangeable usage by the Scanner. Shared logic is consolidated in the base class:
+    *   **Concrete Properties:** `context_limit` and `model_id` properties with connected-checks are shared.
+    *   **Concrete Methods:** `strip_markdown_fences()`, `wait_for_connection(max_attempts)`, `set_context_limit()`, `_parse_and_fix_json_response()`, and `_try_recover_truncated_json()` live in the base class — eliminating duplication. The module-level `_repair_truncated_json()` / `_scan_container_stack()` helpers back the truncation-recovery path.
+    *   **Shared Constants:** `JSON_FIX_SYSTEM_PROMPT` used by both clients for malformed response recovery.
+    *   **Streaming Accumulator:** `StreamAccumulator` wraps `StreamValidator` for shared content accumulation with validation during streaming.
+    *   **`wait_for_connection` Guard:** `max_attempts` parameter (default 0 = unlimited) prevents infinite blocking when the LLM backend is permanently unavailable.
 *   **Prompt Format:** Use an optimized prompt structure that is well-understood by LLMs (system prompt with instructions, user prompt with code context).
 *   **Response Format:** The scanner must request a **structured JSON response** from the LLM with a fixed schema.
 *   **Strict Prompt Instructions:** The system prompt must explicitly forbid markdown code fences, explanations, and any text outside of JSON object.
-*   **Markdown Fence Stripping:** If the LLM wraps JSON in markdown fences (` ```json ... ``` `), the scanner must **automatically strip them** before parsing.
+*   **Markdown Fence Stripping:** If the LLM wraps JSON in markdown fences (` ```json ... ``` `), the scanner must **automatically strip them** before parsing. This also covers the **truncated-fence** case: if the LLM stream is cut off mid-generation (e.g. by `max_tokens`) leaving an opening ```` ```json ```` with no matching close, the opener is still stripped so the partial JSON can be repaired (see Truncation Recovery below).
 *   **JSON Enforcement:** Use API parameter `response_format={ "type": "json_object" }` to guarantee valid JSON output.
 *   **Response is an **array of issues** (multiple issues per query are supported).
 *   Each issue contains: file, line number, description, suggested fix.
 *   **No issues found:** Return an empty array `[]`.
-*   **File Path Validation:** Issues with empty file paths or file paths that don't exist in the target directory are silently discarded. This prevents hallucinated file paths from polluting the results.
+*   **File Path Validation:** Issues with empty file paths or file paths that don't exist in the target directory are silently discarded. Before that, file paths are sanitized: directory traversal (`..`) removed, backslashes normalized to forward slashes, leading slashes stripped, null bytes removed, and paths capped at 1024 chars. Field aliases (`file` → `file_path`, `line` → `line_number`, `fix` → `suggested_fix`) are resolved for common LLM naming variants. Negative line numbers are coerced to 0.
 *   **Reasoning Effort:** The scanner must set **`reasoning_effort = "high"`** in API requests to maximize analysis quality.
 *   **Malformed Response Handling:** If the LLM returns invalid JSON or doesn't follow the schema:
-    *   **Reformat Request:** First, ask the LLM to **reformat its own response** into valid JSON. This is more effective than blind retrying.
+    *   **Truncation Recovery (local, no network):** First, attempt to **repair truncated JSON locally** via `_try_recover_truncated_json()`. This handles the common case where the stream was cut off mid-object (e.g. `max_tokens` hit, dropped connection) leaving a value like `{"issues": [{"file": "x.py", "line_number": 81,`. The repair scans the content tracking string context and the open-container stack, finds the latest safe cut point (right after a comma or a closed value), drops the trailing incomplete fragment, and closes any still-open containers — preserving as much data as possible without a second LLM round-trip. If successful, the recovered result is used directly.
+    *   **Reformat Request:** If local recovery does not apply (e.g., the LLM returned explanation text or a non-JSON preamble), ask the LLM to **reformat its own response** into valid JSON. Uses a shared `JSON_FIX_SYSTEM_PROMPT` to request extraction without markdown fences.
     *   **Retry on failure:** If reformatting fails, retry the original query (no delay/backoff).
     *   **Maximum 3 retries** before skipping the query and logging an error.
     *   Log all retry attempts with attempt count (e.g., "attempt 1/3") to system log.
-    *   Common causes: model timeout, context overflow, or model returning explanation text instead of JSON.
+    *   Common causes: model timeout, context overflow, output truncated by `max_tokens`, or model returning explanation text instead of JSON.
+*   **Streaming Response Validation:** Both LLM backends use **streaming API requests** with real-time chunk validation:
+    *   **Runaway Generation Detection:** A `StreamValidator` monitors streaming chunks as they arrive from the LLM backend. If the LLM generates the same content repeatedly (content loop), stalls on empty chunks, or exceeds the **512KB response size cap**, generation is aborted and the query is retried.
+    *   **Repeat Pattern Detection:** Detects when the last 200-character window repeats 10 consecutive times — indicating the LLM is stuck in a generation loop.
+    *   **Stalled Stream Detection:** 20 consecutive empty chunks trigger abort — catches models that connect but never produce output.
+    *   **Response Size Limit:** Hard cap at 512KB prevents memory exhaustion from excessively large LLM responses.
+    *   Both protections count toward the `max_retries` limit (default 3).
+*   **Response Content Sanitization:** All LLM responses are sanitized before processing:
+    *   **Non-printable Character Stripping:** Null bytes and other control characters (`\\x00-\\x08`, `\\x0b`, `\\x0c`, `\\x0e-\\x1f`) are removed from all string values recursively through the response dict.
+    *   **String Length Limits:** Descriptions capped at 8192 chars, file paths at 1024 chars, code snippets at 16384 chars.
+    *   **File Path Normalization:** Backslashes converted to forward slashes, leading slashes stripped, `..` directory traversal patterns removed, null bytes stripped.
+    *   **Sanitization Pipeline:** `sanitize_llm_response()` → Pydantic `model_validate()` → business logic validators — defense in depth.
+*   **Tool Call Response Validation:** Tool call responses from the LLM are validated through Pydantic models:
+    *   **Schema Validation:** `LLMToolCallResponse.model_validate()` ensures each tool call has a valid `tool_name` (string) and `arguments` (dict). Non-dict arguments are coerced to `{}`; missing `tool_name` raises validation error.
+    *   **Malformed Tool Call Correction:** If the LLM sends a malformed tool call (invalid structure, empty `tool_calls` list, missing required fields), the malformed response is **NOT included in the conversation context**. Instead, a correction message is appended asking the LLM to fix the format and retry.
+    *   **Empty Tool Call Guard:** If `tool_calls` list is present but empty, the LLM is instructed to either call valid tools or provide a final answer — preventing silent infinite loops.
+    *   **Malformed Retry Limit:** After **3 consecutive malformed tool call responses**, tool calling is forcibly terminated and the LLM is instructed to provide its final analysis without further tool calls.
+    *   **Tool Result Validation:** Before tool results are sent back to the LLM, they are validated through `LLMToolResult` which sanitizes error messages, warning strings, and data payloads (non-printable chars stripped, length limits enforced).
 *   **LM Studio Connection Handling:**
     *   **Startup Failure:** If the LLM backend (LM Studio or Ollama) is not running or unreachable at startup, **fail immediately** with a clear error message.
     *   **Mid-Session Failure:** If the LLM backend becomes unavailable during scanning, **pause and retry every 10 seconds** until connection is restored. The scanner handles various connection-related errors including:
@@ -247,6 +278,7 @@ The scanner supports monitoring **multiple projects simultaneously** and automat
     *   **User Commits Changes:** When user commits all changes in the active project, scanner immediately switches to another project with changes
     *   **Switch Takes Precedence:** Project switching takes precedence over completing the current scan cycle - scanner interrupts after the current check completes
     *   **Cooldown Period:** Minimum 5-minute interval between project switches to prevent bouncing behavior
+    *   **Merge/Rebase Escape:** When the active project enters merge/rebase state (detected via unmerged entries in git status), the scanner temporarily switches to another eligible project. The merging project is excluded from active selection until the conflict is resolved and merge/rebase markers are cleared.
 *   **State Preservation:** Each project maintains its own state:
     *   **Full State Preservation:** All state is preserved in memory for each project including:
         *   `scan_info` (checks_run, total_checks, files_scanned, skipped_files)
@@ -314,12 +346,13 @@ The scanner can be installed as a system service to start automatically on boot.
 All scripts include:
 
 *   **60-second startup delay** to allow LLM servers to initialize.
-*   **Reinstall from source:** The `install` command automatically rebuilds and reinstalls code-scanner from the project source directory (using `uv pip install`) before setting up the service. This ensures the service always runs the latest version from the current sources.
+*   **Reinstall from source:** The `install` command automatically rebuilds and reinstalls code-scanner from the project source directory before setting up the service, so the service always runs the latest version from the current sources. It prefers **pipx** (matching the standard install: `pipx install --force <project_root>`) and falls back to `uv pip install` / `pip3 install --user` when pipx is unavailable.
+*   **CLI flag compatibility check:** Before registering the service, the `install` command verifies the installed binary actually supports every flag used in the command (by scanning the binary's `--help` output). If a flag is unsupported—typically because the installed binary is older than the source—it prints a precise, actionable diagnostic (listing the unsupported flag and the reinstall command) instead of failing later with a confusing argparse error. This guards against stale installs.
 *   **Current configuration display:** Scripts display the currently installed code-scanner version/path and the current `<cli_command>` from the existing service (if installed) at startup.
 *   **Test launch** before registering the service.
 *   **Legacy service detection** and removal.
 *   **Full CLI command support:** Scripts accept a full CLI command string as a single argument for multi-project support:
-    *   Example: `./scripts/autostart-linux.sh install "/path/to/project1 -c /path/to/config1 /path/to/project2 -c /path/to/config2"`
+    *   Example: `./scripts/autostart-linux.sh install "/path/to/project1 -c /path/to/config1 /path/to/project2 -c /path/to/config2 --mode branch"`
     *   Script automatically detects code-scanner executable
 
 ### 2.6 Version Management

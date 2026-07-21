@@ -249,6 +249,43 @@ class TestParseArgs:
             with pytest.raises(SystemExit):
                 parse_args()
 
+    def test_parse_unrecognized_arg_lists_known_options(self, capsys):
+        """Unrecognized-argument error lists known options and staleness hint."""
+        with patch.object(sys, 'argv', ['code-scanner', '/project', '--modee', 'branch']):
+            with pytest.raises(SystemExit) as exc_info:
+                parse_args()
+
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        # Concise error line is still present
+        assert "unrecognized arguments: --modee" in captured.err
+        # Actionable hints are appended
+        assert "Known options:" in captured.err
+        assert "--mode" in captured.err  # the *correct* flag is shown
+        assert "outdated" in captured.err  # staleness hint
+
+    def test_parse_invalid_choice_lists_known_options(self, capsys):
+        """Invalid-choice error lists known options."""
+        with patch.object(sys, 'argv', ['code-scanner', '/project', '-m', 'bogus']):
+            with pytest.raises(SystemExit) as exc_info:
+                parse_args()
+
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert "invalid choice" in captured.err
+        assert "Known options:" in captured.err
+
+    def test_parse_missing_projects_uses_plain_error(self, capsys):
+        """Missing-required-argument error is unchanged (no hint block)."""
+        with patch.object(sys, 'argv', ['code-scanner', '-m', 'branch']):
+            with pytest.raises(SystemExit):
+                parse_args()
+
+        captured = capsys.readouterr()
+        assert "arguments are required: projects" in captured.err
+        # No staleness hint for this error class
+        assert "outdated" not in captured.err
+
 
 
 

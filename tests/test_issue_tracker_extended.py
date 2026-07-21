@@ -245,8 +245,183 @@ class TestIssueMatches:
             check_query="check",
             timestamp=now,
         )
-        
+
         # They match because code_snippet is the same
         assert issue1.matches(issue2) is True
+
+
+class TestSteadyResolution:
+    """Tests for content-based (steady) issue resolution.
+
+    Reproduces the userFunds/userFundsForDisplay bug: an issue must not be
+    auto-resolved by LLM non-detection when its code snippet is still present
+    in the file.
+    """
+
+    SNIPPET = (
+        "const userFunds = Math.floor(bonus + balance)\n"
+        "const userFundsForDisplay = Math.floor(bonus + balance)"
+    )
+
+    def _file_content_with_snippet(self) -> str:
+        return (
+            "import QtQuick\n"
+            "Item {\n"
+            f"    {self.SNIPPET.replace(chr(10), chr(10) + '    ')}\n"
+            "    Text { text: 'hello' }\n"
+            "}\n"
+        )
+
+    def _make_issue(self) -> Issue:
+        return Issue(
+            file_path="SimpleQuestDetails.qml",
+            line_number=387,
+            description="Redundant calculation of user funds.",
+            suggested_fix="Use a single variable.",
+            code_snippet=self.SNIPPET,
+            check_query="Check that JavaScript in QML is moved to C++.",
+            timestamp=datetime.now(),
+        )
+
+    def test_resolve_non_matching_keeps_open_when_code_present(self):
+        """Issue kept OPEN when its snippet is still in the file."""
+        tracker = IssueTracker()
+        issue = self._make_issue()
+        tracker.add_issue(issue)
+
+        # New scan reports a *different* issue in the same file; the
+        # userFunds issue is not re-reported but its code is still present.
+        new_issue = Issue(
+            file_path="SimpleQuestDetails.qml",
+            line_number=10,
+            description="Some unrelated issue.",
+            suggested_fix="Fix it.",
+            code_snippet="Text { text: 'typo' }",
+            check_query="check",
+            timestamp=datetime.now(),
+        )
+        content = self._file_content_with_snippet()
+
+        resolved = tracker._resolve_non_matching(
+            "SimpleQuestDetails.qml", [new_issue], file_content=content
+        )
+
+        assert resolved == 0
+        assert issue.status == IssueStatus.OPEN
+
+    def test_resolve_non_matching_resolves_when_code_gone(self):
+        """Issue resolved when its snippet is actually removed from the file."""
+        tracker = IssueTracker()
+        issue = self._make_issue()
+        tracker.add_issue(issue)
+
+        new_issue = Issue(
+            file_path="SimpleQuestDetails.qml",
+            line_number=10,
+            description="Unrelated issue.",
+            suggested_fix="Fix it.",
+            code_snippet="Text { text: 'typo' }",
+            check_query="check",
+            timestamp=datetime.now(),
+        )
+        # File no longer contains the redundant calculation.
+        content = "import QtQuick\nItem {\n    const other = 1\n}\n"
+
+        resolved = tracker._resolve_non_matching(
+            "SimpleQuestDetails.qml", [new_issue], file_content=content
+        )
+
+        assert resolved == 1
+        assert issue.status == IssueStatus.RESOLVED
+
+    def test_resolve_non_matching_legacy_when_no_content(self):
+        """Without file_content, legacy behavior resolves on non-detection."""
+        tracker = IssueTracker()
+        issue = self._make_issue()
+        tracker.add_issue(issue)
+
+        new_issue = Issue(
+            file_path="SimpleQuestDetails.qml",
+            line_number=10,
+            description="Unrelated issue.",
+            suggested_fix="Fix it.",
+            code_snippet="Text { text: 'typo' }",
+            check_query="check",
+            timestamp=datetime.now(),
+        )
+
+        resolved = tracker._resolve_non_matching(
+            "SimpleQuestDetails.qml", [new_issue]  # no file_content
+        )
+
+        assert resolved == 1
+        assert issue.status == IssueStatus.RESOLVED
+
+    def test_resolve_issues_for_file_keeps_open_when_code_present(self):
+        """Zero-new-issues path keeps OPEN when snippet still present."""
+        tracker = IssueTracker()
+        issue = self._make_issue()
+        tracker.add_issue(issue)
+
+        content = self._file_content_with_snippet()
+        resolved = tracker.resolve_issues_for_file(
+            "SimpleQuestDetails.qml", file_content=content
+        )
+
+        assert resolved == 0
+        assert issue.status == IssueStatus.OPEN
+
+    def test_update_from_scan_blocks_resolution_when_code_present(self):
+        """End-to-end: update_from_scan keeps OPEN when snippet present in files_content."""
+        tracker = IssueTracker()
+        issue = self._make_issue()
+        tracker.add_issue(issue)
+
+        # Scan the file but the LLM reports no issues (non-detection).
+        files_content = {"SimpleQuestDetails.qml": self._file_content_with_snippet()}
+        new_count, resolved_count = tracker.update_from_scan(
+            [], ["SimpleQuestDetails.qml"], files_content=files_content
+        )
+
+        assert new_count == 0
+        assert resolved_count == 0
+        assert issue.status == IssueStatus.OPEN
+
+    def test_update_from_scan_resolves_when_code_absent(self):
+        """End-to-end: update_from_scan resolves when snippet removed."""
+        tracker = IssueTracker()
+        issue = self._make_issue()
+        tracker.add_issue(issue)
+
+        files_content = {"SimpleQuestDetails.qml": "import QtQuick\nItem {\n}\n"}
+        new_count, resolved_count = tracker.update_from_scan(
+            [], ["SimpleQuestDetails.qml"], files_content=files_content
+        )
+
+        assert new_count == 0
+        assert resolved_count == 1
+        assert issue.status == IssueStatus.RESOLVED
+
+    def test_empty_snippet_uses_legacy_behavior(self):
+        """Issue with empty snippet resolves via legacy non-detection path."""
+        tracker = IssueTracker()
+        issue = Issue(
+            file_path="test.py",
+            line_number=1,
+            description="Issue without code.",
+            suggested_fix="Fix it.",
+            code_snippet="",  # no snippet -> cannot verify presence
+            check_query="check",
+            timestamp=datetime.now(),
+        )
+        tracker.add_issue(issue)
+
+        files_content = {"test.py": "some content"}
+        new_count, resolved_count = tracker.update_from_scan(
+            [], ["test.py"], files_content=files_content
+        )
+
+        assert resolved_count == 1
+        assert issue.status == IssueStatus.RESOLVED
 
 

@@ -1246,6 +1246,138 @@ class TestScannerAdditionalCoverage:
         assert issues[0].description == "Valid - file exists"
 
 
+class TestValidateLlmResponse:
+    """Tests for :meth:`Scanner._validate_llm_response`."""
+
+    def test_valid_response_returns_none(self, mock_dependencies):
+        scanner = Scanner(**mock_dependencies)
+        result = scanner._validate_llm_response({"issues": []})
+        assert result is None
+
+    def test_valid_response_with_issues_returns_none(self, mock_dependencies):
+        scanner = Scanner(**mock_dependencies)
+        response = {
+            "issues": [
+                {
+                    "file_path": "test.cpp",
+                    "line_number": 10,
+                    "description": "Memory leak",
+                    "suggested_fix": "Use smart pointer",
+                    "code_snippet": "auto* p = new Foo();",
+                }
+            ]
+        }
+        result = scanner._validate_llm_response(response)
+        assert result is None
+
+    def test_valid_response_with_aliased_fields(self, mock_dependencies):
+        scanner = Scanner(**mock_dependencies)
+        response = {
+            "issues": [
+                {
+                    "file": "test.cpp",
+                    "line": 10,
+                    "description": "Memory leak",
+                    "fix": "Use smart pointer",
+                }
+            ]
+        }
+        result = scanner._validate_llm_response(response)
+        assert result is None
+
+    def test_missing_issues_key_returns_error(self, mock_dependencies):
+        scanner = Scanner(**mock_dependencies)
+        # A non-dict input triggers a true Pydantic ValidationError
+        result = scanner._validate_llm_response("not a dict")
+        assert result is not None
+        assert "Pydantic validation" in result
+        assert "Expected JSON schema" in result
+
+    def test_issues_not_a_list_is_coerced_valid(self, mock_dependencies):
+        """Non-list issues are coerced to [] by the model validator, so valid."""
+        scanner = Scanner(**mock_dependencies)
+        result = scanner._validate_llm_response({"issues": "not_a_list"})
+        assert result is None
+
+    def test_invalid_response_with_error_count(self, mock_dependencies):
+        scanner = Scanner(**mock_dependencies)
+        # A response that is literally a number — truly invalid
+        result = scanner._validate_llm_response(42)  # type: ignore[arg-type]
+        assert result is not None
+        assert "Pydantic validation with" in result
+
+    def test_non_dict_response_returns_error_message(self, mock_dependencies):
+        scanner = Scanner(**mock_dependencies)
+        result = scanner._validate_llm_response(None)  # type: ignore[arg-type]
+        assert result is not None
+        assert "Pydantic validation" in result
+
+
+class TestFormatJsonSchemaForLlm:
+    """Tests for :meth:`Scanner._format_json_schema_for_llm`."""
+
+    def test_schema_with_defs_inlines_ref(self, mock_dependencies):
+        scanner = Scanner(**mock_dependencies)
+        schema = {
+            "type": "object",
+            "required": ["issues"],
+            "properties": {
+                "issues": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/LLMIssue"},
+                }
+            },
+            "$defs": {
+                "LLMIssue": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "line_number": {"type": "integer"},
+                        "description": {"type": "string"},
+                        "suggested_fix": {"type": "string"},
+                        "code_snippet": {"type": "string"},
+                    },
+                    "required": ["file_path"],
+                }
+            },
+        }
+        result = scanner._format_json_schema_for_llm(schema)
+        assert "file_path" in result
+        assert "line_number" in result
+        assert "description" in result
+        assert "$defs" not in result
+        assert "$ref" not in result
+        import json
+        parsed = json.loads(result)
+        assert parsed["type"] == "object"
+        assert "required" in parsed
+
+    def test_schema_without_defs_passes_through(self, mock_dependencies):
+        scanner = Scanner(**mock_dependencies)
+        schema = {
+            "type": "object",
+            "required": ["issues"],
+            "properties": {
+                "issues": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                    },
+                }
+            },
+        }
+        result = scanner._format_json_schema_for_llm(schema)
+        assert "file_path" in result
+        assert "$defs" not in result
+
+    def test_schema_without_issues_returns_basic(self, mock_dependencies):
+        scanner = Scanner(**mock_dependencies)
+        schema = {"type": "object", "properties": {}}
+        result = scanner._format_json_schema_for_llm(schema)
+        assert "type" in result
+
+
 class TestFilterIgnoredFiles:
     """Tests for _filter_ignored_files method."""
 

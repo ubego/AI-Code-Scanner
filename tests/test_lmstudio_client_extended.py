@@ -14,6 +14,32 @@ from code_scanner.lmstudio_client import (
 from code_scanner.models import LLMConfig
 
 
+def _make_stream_chunk(content: str = "", finish_reason: str = None):
+    """Build a single streaming chunk MagicMock."""
+    delta = MagicMock()
+    delta.content = content
+    delta.tool_calls = []
+
+    choice = MagicMock()
+    choice.delta = delta
+    choice.finish_reason = finish_reason
+
+    chunk = MagicMock()
+    chunk.choices = [choice]
+    return chunk
+
+
+def _make_stream_response(content: str) -> list[MagicMock]:
+    """Build streaming chunks that accumulate to the given content."""
+    chunks: list[MagicMock] = []
+    chunk_size = max(1, len(content) // 4) if content else 10
+    for i in range(0, len(content), chunk_size):
+        piece = content[i:i + chunk_size]
+        chunks.append(_make_stream_chunk(content=piece))
+    chunks.append(_make_stream_chunk(content="", finish_reason="stop"))
+    return chunks
+
+
 class TestBuildUserPrompt:
     """Tests for build_user_prompt function."""
 
@@ -40,7 +66,7 @@ class TestBuildUserPrompt:
 
 
 class TestStripMarkdownFences:
-    """Tests for _strip_markdown_fences method."""
+    """Tests for strip_markdown_fences method."""
 
     def test_strip_json_fence(self):
         """Strip ```json ... ``` fences."""
@@ -48,7 +74,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '```json\n{"issues": []}\n```'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
     def test_strip_plain_fence(self):
@@ -57,7 +83,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '```\n{"issues": []}\n```'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
     def test_no_fence_unchanged(self):
@@ -66,7 +92,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '{"issues": []}'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
     def test_whitespace_handling(self):
@@ -75,7 +101,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '  ```json\n{"issues": []}\n```  '
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
     def test_case_insensitive(self):
@@ -84,7 +110,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '```JSON\n{"issues": []}\n```'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
 
@@ -119,18 +145,12 @@ class TestLMStudioClientQuery:
         client._model_id = "test-model"
         client._context_limit = 8192
         
-        # First response empty, second response valid
-        mock_response_empty = MagicMock()
-        mock_response_empty.choices = [MagicMock()]
-        mock_response_empty.choices[0].message.content = ""
-        
-        mock_response_valid = MagicMock()
-        mock_response_valid.choices = [MagicMock()]
-        mock_response_valid.choices[0].message.content = '{"issues": []}'
+        empty_chunks = _make_stream_response("")
+        valid_chunks = _make_stream_response('{"issues": []}')
         
         client._client.chat.completions.create.side_effect = [
-            mock_response_empty,
-            mock_response_valid,
+            iter(empty_chunks),
+            iter(valid_chunks),
         ]
         
         result = client.query("system", "user", max_retries=3)
@@ -145,12 +165,8 @@ class TestLMStudioClientQuery:
         client._model_id = "test-model"
         client._context_limit = 8192
         
-        # All responses empty
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = ""
-        
-        client._client.chat.completions.create.return_value = mock_response
+        empty_chunks = _make_stream_response("")
+        client._client.chat.completions.create.return_value = iter(empty_chunks)
         
         with pytest.raises(LLMClientError, match="Failed to get valid JSON"):
             client.query("system", "user", max_retries=3)

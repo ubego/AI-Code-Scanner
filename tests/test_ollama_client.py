@@ -10,6 +10,45 @@ from code_scanner.base_client import LLMClientError, ContextOverflowError
 from code_scanner.models import LLMConfig
 
 
+def _make_ollama_stream_response(content: str, done: bool = True) -> list[bytes]:
+    """Build a streaming Ollama response from a final content string.
+
+    Splits the content into individual chunks (one per character group)
+    and appends a final ``done`` chunk — emulating Ollama's streaming API.
+    """
+    lines: list[bytes] = []
+    chunk_size = max(1, len(content) // 4) if content else 10
+    for i in range(0, len(content), chunk_size):
+        piece = content[i:i + chunk_size]
+        lines.append(
+            json.dumps({"message": {"content": piece}, "done": False}).encode() + b"\n"
+        )
+    if done:
+        lines.append(
+            json.dumps({"message": {"content": ""}, "done": True}).encode() + b"\n"
+        )
+    else:
+        lines.append(
+            json.dumps({"message": {"content": content[-chunk_size:]}, "done": True}).encode() + b"\n"
+        )
+    return lines
+
+
+def _make_ollama_stream_with_tools(tool_calls: list[dict]) -> list[bytes]:
+    """Build a streaming Ollama response that returns tool calls."""
+    lines: list[bytes] = []
+    lines.append(
+        json.dumps({"message": {"content": ""}, "done": False}).encode() + b"\n"
+    )
+    lines.append(
+        json.dumps({
+            "message": {"content": "", "tool_calls": tool_calls},
+            "done": True,
+        }).encode() + b"\n"
+    )
+    return lines
+
+
 class TestOllamaClientInit:
     """Tests for OllamaClient initialization."""
 
@@ -183,8 +222,7 @@ class TestOllamaClientQuery:
         client._model_id = "llama3:latest"
         client._context_limit = 8192
         
-        # Mock the query response
-        response_json = {
+        response_json = json.dumps({
             "issues": [
                 {
                     "file": "main.cpp",
@@ -194,12 +232,11 @@ class TestOllamaClientQuery:
                     "code_snippet": "int* p = new int;"
                 }
             ]
-        }
+        })
+        stream_lines = _make_ollama_stream_response(response_json)
+        
         query_response = MagicMock()
-        query_response.read.return_value = json.dumps({
-            "message": {"content": json.dumps(response_json)},
-            "done": True
-        }).encode()
+        query_response.__iter__ = MagicMock(return_value=iter(stream_lines))
         query_response.__enter__ = MagicMock(return_value=query_response)
         query_response.__exit__ = MagicMock(return_value=False)
         
@@ -221,11 +258,10 @@ class TestOllamaClientQuery:
         
         # Response wrapped in markdown fences
         response_content = '```json\n{"issues": []}\n```'
+        stream_lines = _make_ollama_stream_response(response_content)
+        
         query_response = MagicMock()
-        query_response.read.return_value = json.dumps({
-            "message": {"content": response_content},
-            "done": True
-        }).encode()
+        query_response.__iter__ = MagicMock(return_value=iter(stream_lines))
         query_response.__enter__ = MagicMock(return_value=query_response)
         query_response.__exit__ = MagicMock(return_value=False)
         
@@ -244,20 +280,15 @@ class TestOllamaClientQuery:
         client._model_id = "llama3:latest"
         client._context_limit = 8192
         
-        # First response is empty, second is valid
+        empty_lines = _make_ollama_stream_response("", done=True)
         empty_response = MagicMock()
-        empty_response.read.return_value = json.dumps({
-            "message": {"content": ""},
-            "done": True
-        }).encode()
+        empty_response.__iter__ = MagicMock(return_value=iter(empty_lines))
         empty_response.__enter__ = MagicMock(return_value=empty_response)
         empty_response.__exit__ = MagicMock(return_value=False)
         
+        valid_lines = _make_ollama_stream_response('{"issues": []}')
         valid_response = MagicMock()
-        valid_response.read.return_value = json.dumps({
-            "message": {"content": '{"issues": []}'},
-            "done": True
-        }).encode()
+        valid_response.__iter__ = MagicMock(return_value=iter(valid_lines))
         valid_response.__enter__ = MagicMock(return_value=valid_response)
         valid_response.__exit__ = MagicMock(return_value=False)
         
@@ -394,7 +425,7 @@ class TestOllamaClientModelInfo:
 
 
 class TestStripMarkdownFences:
-    """Tests for _strip_markdown_fences method."""
+    """Tests for strip_markdown_fences method."""
 
     @pytest.fixture
     def client(self) -> OllamaClient:
@@ -411,19 +442,19 @@ class TestStripMarkdownFences:
     def test_strip_json_fences(self, client: OllamaClient):
         """Test stripping ```json fences."""
         content = '```json\n{"issues": []}\n```'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
     def test_strip_plain_fences(self, client: OllamaClient):
         """Test stripping plain ``` fences."""
         content = '```\n{"issues": []}\n```'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
     def test_no_fences(self, client: OllamaClient):
         """Test content without fences is unchanged."""
         content = '{"issues": []}'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         assert result == '{"issues": []}'
 
 

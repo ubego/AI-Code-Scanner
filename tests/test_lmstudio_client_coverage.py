@@ -14,6 +14,32 @@ from code_scanner.lmstudio_client import (
 from code_scanner.config import LLMConfig
 
 
+def _make_lmstudio_stream_chunk(content: str = "", finish_reason: str = None):
+    """Build a single streaming chunk MagicMock."""
+    delta = MagicMock()
+    delta.content = content
+    delta.tool_calls = []
+
+    choice = MagicMock()
+    choice.delta = delta
+    choice.finish_reason = finish_reason
+
+    chunk = MagicMock()
+    chunk.choices = [choice]
+    return chunk
+
+
+def _make_lmstudio_stream_response(content: str) -> list[MagicMock]:
+    """Build a list of streaming chunks that accumulate to the given content."""
+    chunks: list[MagicMock] = []
+    chunk_size = max(1, len(content) // 4) if content else 10
+    for i in range(0, len(content), chunk_size):
+        piece = content[i:i + chunk_size]
+        chunks.append(_make_lmstudio_stream_chunk(content=piece))
+    chunks.append(_make_lmstudio_stream_chunk(content="", finish_reason="stop"))
+    return chunks
+
+
 class TestLMStudioClientConnect:
     """Tests for LMStudioClient connection."""
 
@@ -83,10 +109,8 @@ class TestLMStudioClientQuery:
         client._model_id = "test-model"
         client._context_limit = 8000
         
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = '{"issues": []}'
-        client._client.chat.completions.create.return_value = mock_response
+        stream_chunks = _make_lmstudio_stream_response('{"issues": []}')
+        client._client.chat.completions.create.return_value = iter(stream_chunks)
         
         result = client.query("system", "user")
         
@@ -100,10 +124,8 @@ class TestLMStudioClientQuery:
         client._model_id = "test-model"
         client._context_limit = 8000
         
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = '```json\n{"issues": []}\n```'
-        client._client.chat.completions.create.return_value = mock_response
+        stream_chunks = _make_lmstudio_stream_response('```json\n{"issues": []}\n```')
+        client._client.chat.completions.create.return_value = iter(stream_chunks)
         
         result = client.query("system", "user")
         
@@ -118,21 +140,17 @@ class TestLMStudioClientQuery:
         client._context_limit = 8000
         client._supports_json_format = True
         
-        # First call fails with response_format error
         api_error = APIError(
             message="response_format is not supported",
             request=MagicMock(),
             body=None
         )
         
-        # Second call succeeds
-        success_response = MagicMock()
-        success_response.choices = [MagicMock()]
-        success_response.choices[0].message.content = '{"issues": []}'
+        success_chunks = _make_lmstudio_stream_response('{"issues": []}')
         
         client._client.chat.completions.create.side_effect = [
             api_error,
-            success_response
+            iter(success_chunks),
         ]
         
         result = client.query("system", "user")
@@ -165,10 +183,8 @@ class TestLMStudioClientQuery:
         client._model_id = "test-model"
         client._context_limit = 8000
         
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = 'not valid json'
-        client._client.chat.completions.create.return_value = mock_response
+        stream_chunks = _make_lmstudio_stream_response("not valid json")
+        client._client.chat.completions.create.return_value = iter(stream_chunks)
         
         with pytest.raises(LLMClientError) as exc_info:
             client.query("system", "user", max_retries=2)
@@ -183,17 +199,12 @@ class TestLMStudioClientQuery:
         client._model_id = "test-model"
         client._context_limit = 8000
         
-        empty_response = MagicMock()
-        empty_response.choices = [MagicMock()]
-        empty_response.choices[0].message.content = ''
-        
-        valid_response = MagicMock()
-        valid_response.choices = [MagicMock()]
-        valid_response.choices[0].message.content = '{"issues": []}'
+        empty_chunks = _make_lmstudio_stream_response("")
+        valid_chunks = _make_lmstudio_stream_response('{"issues": []}')
         
         client._client.chat.completions.create.side_effect = [
-            empty_response,
-            valid_response
+            iter(empty_chunks),
+            iter(valid_chunks),
         ]
         
         result = client.query("system", "user")
@@ -262,7 +273,7 @@ class TestTryFixJsonResponse:
 
 
 class TestStripMarkdownFences:
-    """Tests for _strip_markdown_fences method."""
+    """Tests for strip_markdown_fences method."""
 
     def test_strip_json_fence(self):
         """Strips ```json fence."""
@@ -270,7 +281,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '```json\n{"key": "value"}\n```'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         
         assert result == '{"key": "value"}'
 
@@ -280,7 +291,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '```\n{"key": "value"}\n```'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         
         assert result == '{"key": "value"}'
 
@@ -290,7 +301,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '  ```json\n  {"key": "value"}  \n```  '
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         
         assert '{"key": "value"}' in result
 
@@ -300,7 +311,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '{"key": "value"}'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         
         assert result == '{"key": "value"}'
 
@@ -310,7 +321,7 @@ class TestStripMarkdownFences:
         client = LMStudioClient(config)
         
         content = '```JSON\n{"key": "value"}\n```'
-        result = client._strip_markdown_fences(content)
+        result = client.strip_markdown_fences(content)
         
         assert result == '{"key": "value"}'
 
@@ -604,3 +615,112 @@ class TestLMStudioClientContextLimit:
             _ = client.context_limit
         
         assert "Not connected" in str(exc_info.value)
+
+
+class TestLMStudioStreamingToolCalls:
+    """Tests for streaming tool call handling in LM Studio client."""
+
+    def test_streaming_with_tool_calls(self):
+        """LM Studio streaming response with tool calls is handled correctly."""
+        config = LLMConfig(backend="lm-studio", host="localhost", port=1234, context_limit=16384)
+        client = LMStudioClient(config)
+        client._client = MagicMock()
+        client._model_id = "test-model"
+        client._context_limit = 8000
+
+        def _make_tool_call_chunk(index, name=None, args=None, finish=None):
+            delta = MagicMock()
+            delta.content = ""
+            tc_delta = MagicMock()
+            tc_delta.index = index
+            tc_delta.id = None
+            tc_delta.function = MagicMock()
+            tc_delta.function.name = name
+            tc_delta.function.arguments = args or ""
+            delta.tool_calls = [tc_delta]
+            choice = MagicMock()
+            choice.delta = delta
+            choice.finish_reason = finish
+            chunk = MagicMock()
+            chunk.choices = [choice]
+            return chunk
+
+        tools_param = [{"type": "function", "function": {"name": "search_text"}}]
+        stream_chunks = [
+            _make_tool_call_chunk(0, name="search_text", args='{"patterns":'),
+            _make_tool_call_chunk(0, args='"found"}'),
+            _make_tool_call_chunk(0, finish="tool_calls"),
+        ]
+        client._client.chat.completions.create.return_value = iter(stream_chunks)
+
+        result = client.query("sys", "user", tools=tools_param)
+
+        assert "tool_calls" in result
+        assert len(result["tool_calls"]) == 1
+        assert result["tool_calls"][0]["tool_name"] == "search_text"
+        assert result["tool_calls"][0]["arguments"] == {"patterns": "found"}
+
+    def test_streaming_with_tool_calls_empty_arguments(self):
+        """Tool call with empty arguments handled."""
+        config = LLMConfig(backend="lm-studio", host="localhost", port=1234, context_limit=16384)
+        client = LMStudioClient(config)
+        client._client = MagicMock()
+        client._model_id = "test-model"
+        client._context_limit = 8000
+
+        tools_param = [{"type": "function", "function": {"name": "list_directory"}}]
+
+        # Chunk with tool call but empty args
+        delta = MagicMock()
+        delta.content = ""
+        tc_delta = MagicMock()
+        tc_delta.index = 0
+        tc_delta.function = MagicMock()
+        tc_delta.function.name = "list_directory"
+        tc_delta.function.arguments = ""
+        delta.tool_calls = [tc_delta]
+
+        choice = MagicMock()
+        choice.delta = delta
+        choice.finish_reason = "tool_calls"
+        chunk = MagicMock()
+        chunk.choices = [choice]
+
+        client._client.chat.completions.create.return_value = iter([chunk])
+
+        result = client.query("sys", "user", tools=tools_param)
+
+        assert "tool_calls" in result
+        assert result["tool_calls"][0]["arguments"] == {}
+
+    def test_malformed_tool_call_in_stream_retries(self):
+        """Malformed tool call in LM Studio streaming is retried."""
+        config = LLMConfig(backend="lm-studio", host="localhost", port=1234, context_limit=16384)
+        client = LMStudioClient(config)
+        client._client = MagicMock()
+        client._model_id = "test-model"
+        client._context_limit = 8000
+
+        tools_param = [{"type": "function", "function": {"name": "search_text"}}]
+
+        delta = MagicMock()
+        delta.content = ""
+        delta.tool_calls = []
+        choice = MagicMock()
+        choice.delta = delta
+        choice.finish_reason = "stop"
+        chunk = MagicMock()
+        chunk.choices = [choice]
+        empty_stream = [chunk]
+
+        valid_stream = [
+            _make_lmstudio_stream_chunk(content='{"issues": []}'),
+            _make_lmstudio_stream_chunk(content="", finish_reason="stop"),
+        ]
+        client._client.chat.completions.create.side_effect = [
+            iter(empty_stream),
+            iter(valid_stream),
+        ]
+
+        result = client.query("sys", "user", tools=tools_param, max_retries=3)
+        assert result == {"issues": []}

@@ -106,52 +106,73 @@ class TestGitWatcherMergeConflict:
     """Tests for merge/rebase conflict detection."""
 
     def test_merge_head_detected(self, temp_git_repo):
-        """Test that MERGE_HEAD file is detected."""
+        """Test that MERGE_HEAD file with unmerged entries is detected."""
+        import subprocess
+        self._create_conflict(temp_git_repo, "merge_conflict.txt", merge=True)
+
         watcher = GitWatcher(temp_git_repo)
         watcher.connect()
-        
-        # Simulate merge in progress
-        merge_head = temp_git_repo / ".git" / "MERGE_HEAD"
-        merge_head.write_text("abc123\n")
-        
+
         state = watcher.get_state()
-        
+
         assert state.is_conflict_resolution_in_progress is True
-        
-        # Cleanup
-        merge_head.unlink()
+        assert state.is_merging
 
     def test_rebase_head_detected(self, temp_git_repo):
-        """Test that REBASE_HEAD file is detected."""
+        """Test that REBASE_HEAD file with unmerged entries is detected."""
+        import subprocess
+        self._create_conflict(temp_git_repo, "rebase_conflict.txt", merge=False)
+
         watcher = GitWatcher(temp_git_repo)
         watcher.connect()
-        
-        # Simulate rebase in progress
-        rebase_head = temp_git_repo / ".git" / "REBASE_HEAD"
-        rebase_head.write_text("abc123\n")
-        
+
         state = watcher.get_state()
-        
+
         assert state.is_conflict_resolution_in_progress is True
-        
-        # Cleanup
-        rebase_head.unlink()
+        assert state.is_rebasing
 
     def test_rebase_merge_dir_detected(self, temp_git_repo):
-        """Test that rebase-merge directory is detected."""
+        """Test that rebase-merge dir with unmerged entries is detected."""
+        import subprocess
+        self._create_conflict(temp_git_repo, "rebase_merge_conflict.txt", merge=False)
+
         watcher = GitWatcher(temp_git_repo)
         watcher.connect()
-        
-        # Simulate interactive rebase
-        rebase_dir = temp_git_repo / ".git" / "rebase-merge"
-        rebase_dir.mkdir()
-        
+
         state = watcher.get_state()
-        
+
         assert state.is_conflict_resolution_in_progress is True
-        
-        # Cleanup
-        rebase_dir.rmdir()
+        assert state.is_rebasing
+
+    def _create_conflict(self, repo: Path, filename: str, merge: bool) -> None:
+        """Create a real merge/rebase conflict with unmerged entries."""
+        import subprocess
+
+        def run(cmd, **kw):
+            return subprocess.run(cmd, cwd=repo, capture_output=True, **kw)
+
+        # Get current branch
+        result = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True)
+        base_branch = result.stdout.strip()
+
+        (repo / filename).write_text("version 1\n")
+        run(["git", "add", filename])
+        run(["git", "commit", "-m", "base commit for conflict"])
+
+        run(["git", "checkout", "-b", "conflict_side"])
+        (repo / filename).write_text("version 2\n")
+        run(["git", "add", filename])
+        run(["git", "commit", "-m", "side commit"])
+
+        run(["git", "checkout", base_branch])
+        (repo / filename).write_text("version 3\n")
+        run(["git", "add", filename])
+        run(["git", "commit", "-m", "main commit"])
+
+        if merge:
+            run(["git", "merge", "conflict_side"])
+        else:
+            run(["git", "rebase", "conflict_side"])
 
 
 class TestGitWatcherFileStatuses:

@@ -243,27 +243,36 @@ You can configure Code Scanner to start automatically on login using systemd use
 
 ### Quick Setup
 
-Run the autostart script:
+Run the autostart script with `install` and pass the **full CLI command** (the same arguments you would pass to `code-scanner`) as a single quoted string:
 
 ```bash
-./scripts/autostart-linux.sh
+./scripts/autostart-linux.sh install "/path/to/project -c /path/to/config.toml"
 ```
 
-The script will interactively guide you through:
+Multiple projects and modes are supported in one command:
 
-1. **Project path** - The directory to scan
-2. **Config file path** - Your `code_scanner_config.toml` location
-3. **Test launch** - Verifies the scanner works before registering
-4. **Service registration** - Creates a systemd user service
+```bash
+./scripts/autostart-linux.sh install "/path/to/project1 -c /path/to/config1.toml /path/to/project2 -c /path/to/config2.toml --mode branch"
+```
+
+The script will:
+
+1. **Reinstall from source** — rebuilds and reinstalls code-scanner from the project source (preferring pipx, falling back to `uv`/`pip`), so the service runs the latest version.
+2. **Verify CLI compatibility** — checks the installed binary supports every flag in your command and prints a clear diagnostic if the install is stale (e.g. missing `--mode`).
+3. **Test launch** the scanner to verify the command works.
+4. **Register the systemd service** at `~/.config/systemd/user/code-scanner.service`.
+
+Other commands: `./scripts/autostart-linux.sh remove` (uninstall) and `./scripts/autostart-linux.sh status`.
 
 ### What the Script Does
 
-1. **Detects legacy services** and offers to remove them
-2. **Validates paths** for project and config file
-3. **Test launches** the scanner to verify configuration
-4. **Creates systemd service** at `~/.config/systemd/user/code-scanner.service`
-5. **Enables autostart** on user login
-6. **Includes 60-second delay** to allow LLM backend startup
+1. **Reinstalls** code-scanner from source (pipx/uv/pip)
+2. **Verifies** the installed binary supports all CLI flags used
+3. **Detects legacy services** and offers to replace them
+4. **Test launches** the scanner to verify configuration
+5. **Creates systemd service** at `~/.config/systemd/user/code-scanner.service`
+6. **Enables autostart** on user login
+7. **Includes 60-second delay** to allow LLM backend startup
 
 ### Managing the Service
 
