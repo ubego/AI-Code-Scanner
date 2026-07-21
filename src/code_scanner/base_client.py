@@ -24,6 +24,171 @@ _FENCE_PATTERN = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# Opening fence without a closing one — happens when the LLM stream is
+# truncated (e.g. by max_tokens) mid-way through a fenced JSON block.
+# Captures everything after the opening fence so it can be parsed directly.
+_UNCLOSED_FENCE_PATTERN = re.compile(
+    r'^```(?:json)?\s*\n?(.*)$',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _repair_truncated_json(content: str) -> Optional[dict]:
+    """Locally repair JSON that was truncated mid-generation.
+
+    Generates a series of candidate cut points (positions right after a
+    comma or right after a complete value at the outer container level),
+    and for each one (most-data-preserving first), tries to close the
+    still-open containers and parse the result. Returns the first that
+    parses successfully.
+
+    Args:
+        content: JSON text that begins with '{' or '[' but may be cut off.
+
+    Returns:
+        Parsed JSON object on success.
+
+    Raises:
+        ValueError: If content does not look like repairable JSON.
+        json.JSONDecodeError: If no candidate produced valid JSON.
+    """
+    if not content or content[0] not in "{[":
+        raise ValueError("content does not start with a JSON container")
+
+    in_string = False
+    escape = False
+    stack: list[str] = []
+    # Candidate cut points: positions in the content that mark the end of
+    # a complete value at some level. We try them in reverse (latest first)
+    # so we recover as much data as possible.
+    candidates: list[int] = []
+
+    for i, ch in enumerate(content):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+
+        if ch in "{[":
+            stack.append(ch)
+            continue
+
+        if ch in "}]":
+            if not stack:
+                raise ValueError("unbalanced closing brace")
+            opener = stack.pop()
+            if (opener == "{" and ch != "}") or (opener == "[" and ch != "]"):
+                raise ValueError("mismatched closing brace")
+            # Right after closing a container is a candidate — the value
+            # before this position is complete at the new (popped) depth.
+            candidates.append(i + 1)
+            continue
+
+        # A comma marks the end of a complete value at this nesting level.
+        if ch == ",":
+            candidates.append(i)
+
+    # Well-formed: nothing to repair.
+    if not stack:
+        return json.loads(content)
+
+    final_stack = tuple(stack)
+
+    # Try each candidate cut point, latest first. For each, drop anything
+    # after the cut, strip a trailing comma, and close all containers that
+    # were still open at this cut. Parse — return on first success.
+    #
+    # First try the full content as-is: many truncations just drop the
+    # trailing close brace(s), and closing from the final stack preserves
+    # the most recent complete value (e.g. the last object member).
+    all_candidates = list(candidates) + [len(content)]
+    for pos in reversed(all_candidates):
+        # Reconstruct the stack as it was at this candidate position by
+        # re-scanning. (Cheap relative to network I/O this avoids.)
+        prefix = content[:pos]
+        scan_stack = _scan_container_stack(prefix)
+        if scan_stack is None:
+            continue  # malformed; skip
+        # The candidate is only valid if the stack at that point is a
+        # prefix of the final (still-open) stack — otherwise closing
+        # would not produce the same outer structure.
+        if tuple(final_stack[:len(scan_stack)]) != tuple(scan_stack):
+            continue
+
+        truncated = prefix.rstrip()
+        # Drop a trailing partial key:value fragment if it looks incomplete
+        # (heuristic: a key with no value ends with `: ` or just `"key":`).
+        # Specifically, if the truncated text ends with `:` or `: `, the
+        # last key had no value and json.loads will fail.
+        if truncated.endswith(":") or truncated.endswith(": "):
+            # Cut back to before the incomplete key.
+            cut = truncated.rfind(",")
+            if cut > 0:
+                truncated = truncated[:cut]
+            else:
+                continue  # nothing left to recover here
+
+        if truncated.endswith(","):
+            truncated = truncated[:-1]
+        for opener in reversed(scan_stack):
+            truncated += "}" if opener == "{" else "]"
+        try:
+            return json.loads(truncated)
+        except json.JSONDecodeError:
+            continue
+
+    # No usable candidate — recover as an empty outer container.
+    opener = content[0]
+    repaired = opener + ("}" if opener == "{" else "]")
+    return json.loads(repaired)
+
+
+def _scan_container_stack(prefix: str) -> Optional[list[str]]:
+    """Scan a JSON prefix and return the open-container stack.
+
+    Tracks string context and nesting. Used to reconstruct the stack at
+    a candidate truncation point.
+
+    Returns:
+        List of '{'/'[' chars still open at the end of the prefix, or
+        None if a structural error (unbalanced/mismatched brace) is hit.
+
+    Args:
+        prefix: A prefix of JSON content.
+    """
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in prefix:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if not stack:
+                return None
+            opener = stack.pop()
+            if (opener == "{" and ch != "}") or (opener == "[" and ch != "]"):
+                return None
+    return stack
+
 
 class LLMClientError(Exception):
     """Error communicating with LLM backend."""
@@ -193,6 +358,11 @@ class BaseLLMClient(ABC):
         LLMs often wrap JSON in ```json ... ``` blocks despite
         instructions not to.  This extracts the content inside.
 
+        Handles complete fences (opening + closing) and also the truncated
+        case where the stream was cut off (opening fence only, no closing
+        fence) — which otherwise leaves stray backticks that break JSON
+        parsing.
+
         Args:
             content: Raw response content.
 
@@ -200,9 +370,17 @@ class BaseLLMClient(ABC):
             Content with markdown fences stripped.
         """
         content = content.strip()
+        # Complete fenced block: ```json ... ```
         match = _FENCE_PATTERN.match(content)
         if match:
             return match.group(1).strip()
+        # Truncated fenced block: opening fence but no closing (stream cut
+        # off mid-generation). Strip the opening fence so the remainder can
+        # be parsed/repaired instead of failing on the leading backticks.
+        if content.startswith("```"):
+            match = _UNCLOSED_FENCE_PATTERN.match(content)
+            if match:
+                return match.group(1).strip()
         return content
 
     def _try_fix_json_response(self, malformed_content: str) -> Optional[dict]:
@@ -243,10 +421,58 @@ class BaseLLMClient(ABC):
                 attempt + 1, max_retries, e,
             )
             logger.debug("--- Raw response ---\n%s\n--- End raw response ---", raw_preview)
+
+            # Before asking the LLM to repair the response (slow, another
+            # network round trip), try to recover truncated JSON locally.
+            # This commonly happens when generation is cut off mid-object
+            # by max_tokens — e.g. '{"issues": [{"file": "x.py", ...'.
+            recovered = self._try_recover_truncated_json(content)
+            if recovered is not None:
+                logger.info(
+                    "Recovered truncated JSON response locally "
+                    "(no LLM round-trip needed)."
+                )
+                return recovered
+
             fix_result = self._try_fix_json_response(content)
             if fix_result is not None:
                 logger.info("%s successfully reformatted response to valid JSON.", self.backend_name)
                 return fix_result
+            return None
+
+    @staticmethod
+    def _try_recover_truncated_json(content: str) -> Optional[dict]:
+        """Attempt to locally repair truncated JSON without an LLM call.
+
+        Handles the common truncation pattern where the stream ended
+        mid-object (e.g. when max_tokens was hit). Strategy:
+
+        1. Only attempt on content that starts with '{' or '[' (JSON-like).
+        2. Drop trailing partial key/value fragments after the last
+           complete object boundary, then close open structures.
+        3. Try json.loads on the repaired string.
+
+        Args:
+            content: Raw content (fences already stripped).
+
+        Returns:
+            Parsed dict/list on success, None if local repair was not
+            possible or also failed.
+        """
+        if not content:
+            return None
+        stripped = content.strip()
+        if not stripped or stripped[0] not in "{[":
+            return None
+
+        # Find the position of the last *complete* top-level value. For an
+        # object, that's the last '}' at the same nesting depth as the
+        # opening '{'; for an array, the analogous ']' or the last ','.
+        # Rather than fully parse (the content is malformed by definition),
+        # scan with depth tracking respecting strings.
+        try:
+            return _repair_truncated_json(stripped)
+        except (ValueError, json.JSONDecodeError):
             return None
 
 
@@ -266,6 +492,16 @@ class StreamAccumulator:
         else:
             self.validator.feed("")
 
+    def feed_reasoning(self, reasoning: str) -> None:
+        """Register reasoning/thinking tokens without accumulating them.
+
+        These tokens must not appear in the final content (they are not part
+        of the JSON answer), but they prove the model is actively generating
+        and must not be counted as a stalled stream.
+        """
+        if reasoning:
+            self.validator.note_activity()
+
     @property
     def content(self) -> str:
         """The accumulated full content."""
@@ -280,8 +516,13 @@ SYSTEM_PROMPT_TEMPLATE = """You are an expert code analysis assistant. Your task
 1. **STAY ON TOPIC** - Only report issues matching the check query. Ignore unrelated problems.
 2. **USE TOOLS** - Verify findings with available tools before reporting.
 3. **USE EXACT FILE INFO** - Only reference files and lines from "Files to analyze" section.
+4. **BE TERSE** - Keep your final JSON answer SHORT:
+   - Report at most 5 issues per check.
+   - Each "description" and "suggested_fix" must be one sentence (max ~20 words).
+   - "code_snippet" must be at most 2 lines.
+   - Do NOT explain, summarize, or add any text outside the JSON.
 
-## OUTPUT FORMAT (strict JSON, no markdown)
+## OUTPUT FORMAT (strict JSON only, no markdown, no preamble)
 
 {"issues": [{"file": "path", "line_number": 42, "description": "...", "suggested_fix": "...", "code_snippet": "..."}]}
 
@@ -323,6 +564,13 @@ def build_user_prompt(check_query: str, files_content: dict[str, str]) -> str:
         )
 
     return "\n".join(prompt_parts)
+
+
+# Hardcoded generation budgets (not user-configurable). These cap how much the
+# model may output per call. NOTE: for reasoning models in LM Studio/Ollama the
+# "thinking" tokens are NOT counted toward max_tokens, so reasoning_effort is
+# the primary control over thinking length; these caps bound the final answer.
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
 
 class RequestBuilder:
@@ -427,6 +675,11 @@ class RequestBuilder:
         if context_limit:
             request["options"]["num_ctx"] = context_limit
         
+        # Cap GENERATED tokens (num_predict). Ollama defaults to unlimited
+        # generation, which lets reasoning models run for tens of minutes.
+        # Hardcoded sane budget (thinking tokens are bounded by reasoning_effort).
+        request["options"]["num_predict"] = DEFAULT_MAX_OUTPUT_TOKENS
+        
         # Add tools if provided
         if tools:
             request["tools"] = tools
@@ -450,9 +703,9 @@ class RequestBuilder:
         Args:
             model: Model identifier to use.
             system_prompt: System instructions for the LLM.
-            user_prompt: User message with code context.
+            user_prompt: User message with file context.
             tools: Optional list of tool definitions for function calling.
-            context_limit: Optional context limit in tokens (passed as max_tokens).
+            context_limit: Optional context limit in tokens (for budgeting).
             temperature: Temperature parameter (default 0.1 for consistent output).
             top_p: Top-p (nucleus) sampling parameter (default 0.85).
             reasoning_effort: Reasoning effort level (default "high").
@@ -481,8 +734,12 @@ class RequestBuilder:
         if response_format:
             request["response_format"] = response_format
         
-        # Add max_tokens if context limit provided
-        if context_limit:
-            request["max_tokens"] = context_limit
+        # Cap GENERATED tokens (max_tokens). This is the completion budget,
+        # NOT the context window. Previously this was set to the full
+        # context_limit (e.g. 128000), which let reasoning models generate
+        # for tens of minutes per call. Hardcoded to a small, sane budget.
+        # NOTE: thinking/reasoning tokens are NOT bounded by this on most
+        # backends — reasoning_effort controls those.
+        request["max_tokens"] = DEFAULT_MAX_OUTPUT_TOKENS
         
         return request

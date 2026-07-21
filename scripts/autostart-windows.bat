@@ -1,7 +1,7 @@
 @echo off
 REM Code Scanner Autostart Management - Windows (Task Scheduler)
 REM Usage: autostart-windows.bat [install|remove|status] "<cli_command>"
-REM Example: autostart-windows.bat install "C:\path\to\project1 -c C:\path\to\config1 C:\path\to\project2 -c C:\path\to\config2"
+REM Example: autostart-windows.bat install "C:\path\to\project1 -c C:\path\to\config1 C:\path\to\project2 -c C:\path\to\config2 --mode branch"
 
 setlocal enabledelayedexpansion
 
@@ -52,7 +52,7 @@ echo   remove                      Remove autostart task
 echo   status                      Check task status
 echo.
 echo Examples:
-echo   %~nx0 install "C:\path\to\project1 -c C:\path\to\config1 C:\path\to\project2 -c C:\path\to\config2"
+echo   %~nx0 install "C:\path\to\project1 -c C:\path\to\config1 C:\path\to\project2 -c C:\path\to\config2 --mode branch"
 echo   %~nx0 remove
 echo   %~nx0 status
 exit /b 1
@@ -73,6 +73,56 @@ if "%SCANNER_CMD%"=="" (
 )
 if "%SCANNER_CMD%"=="" (
     echo [ERROR] Could not find code-scanner or uv. Please install code-scanner first.
+    exit /b 1
+)
+
+REM Resolve project root (parent of this script's directory)
+set "PROJECT_ROOT=%SCRIPT_DIR%.."
+
+REM Reinstall from source so the on-PATH binary matches the source.
+REM Prefer pipx (matches the standard install), fall back to uv/pip.
+echo [INFO] Reinstalling code-scanner from source: %PROJECT_ROOT%
+where pipx >nul 2>&1
+if not errorlevel 1 (
+    pipx install --force "%PROJECT_ROOT%" >nul 2>&1
+    if errorlevel 1 (
+        echo [WARNING] pipx reinstall failed; continuing with the current binary.
+    ) else (
+        for /f "delims=" %%v in ('code-scanner --version 2^>nul') do echo [SUCCESS] Reinstalled code-scanner: %%v
+    )
+) else (
+    where uv >nul 2>&1
+    if not errorlevel 1 (
+        uv pip install "%PROJECT_ROOT%" >nul 2>&1
+        if errorlevel 1 (
+            echo [WARNING] uv reinstall failed; continuing with the current binary.
+        )
+    ) else (
+        echo [WARNING] Neither pipx nor uv found; skipping reinstall. The service will use the current binary.
+    )
+)
+
+REM Verify the installed binary supports every long flag (--mode, --commit, ...)
+REM in the command. Uses PowerShell to scan --help output; emits a clear
+REM diagnostic if a flag is unsupported (stale install) instead of a confusing
+REM argparse error during test launch.
+powershell -NoProfile -Command ^
+  "$cmdArgs=' %CLI_ARGS% ';" ^
+  "$help = code-scanner --help 2>&1 | Out-String;" ^
+  "$missing = @();" ^
+  "foreach ($m in [regex]::Matches($cmdArgs, '--[a-z][a-z0-9-]*')) {" ^
+  "  $flag = $m.Value;" ^
+  "  if ($help -notlike \"*$flag*\") { $missing += $flag }" ^
+  "};" ^
+  "if ($missing.Count -gt 0) {" ^
+  "  Write-Host '';" ^
+  "  Write-Host '[ERROR] Installed code-scanner does not support: ' ($missing -join ', ') -ForegroundColor Red;" ^
+  "  Write-Host '[ERROR] This usually means the installed binary is older than the source.' -ForegroundColor Red;" ^
+  "  Write-Host '[ERROR] Re-install from source, e.g.:' -ForegroundColor Red;" ^
+  "  Write-Host '[ERROR]   pipx install --force \"%PROJECT_ROOT%\"' -ForegroundColor Red;" ^
+  "  exit 1" ^
+  "}"
+if errorlevel 1 (
     exit /b 1
 )
 

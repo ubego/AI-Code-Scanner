@@ -10,7 +10,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 from . import __version__
 from .config import Config, ConfigError, load_config
@@ -534,6 +534,52 @@ class Application:
             pass
 
 
+def _clearer_error(self: argparse.ArgumentParser, message: str) -> NoReturn:
+    """Replacement for ``ArgumentParser.error`` with actionable hints.
+
+    Standard argparse prints a bare ``error: unrecognized arguments: --mode``
+    which gives no hint whether the flag name is mistyped or the installed
+    binary is simply stale (missing a newer flag). This handler keeps the
+    concise one-line error but, for unrecognized-argument and invalid-choice
+    errors, appends the list of known options and an explicit hint at the two
+    likely causes (typo, or outdated install).
+    """
+    self.print_usage(sys.stderr)
+    prog = self.prog
+
+    msg_lower = message.lower()
+    is_unrecognized = msg_lower.startswith("unrecognized arguments")
+    is_invalid_choice = "invalid choice" in msg_lower
+
+    sys.stderr.write(f"{prog}: error: {message}\n")
+
+    if is_unrecognized or is_invalid_choice:
+        # Collect the known optional flags (e.g. -c/--config, -m/--mode).
+        known: list[str] = []
+        for action in self._actions:  # noqa: SLF001 (argparse internals)
+            for opt in action.option_strings:
+                if opt in ("-h", "--help"):
+                    continue
+                if opt not in known:
+                    known.append(opt)
+
+        hint_lines = [
+            "",
+            "Known options: "
+            + (", ".join(known) if known else "(none)")
+            + ", and one or more project directories.",
+        ]
+        if is_unrecognized:
+            hint_lines.append(
+                "If the flag is correct, the installed code-scanner may be "
+                "outdated. Reinstall from source, e.g.:\n"
+                "  pipx install --force /path/to/code-scanner"
+            )
+        sys.stderr.write("\n".join(hint_lines) + "\n")
+
+    self.exit(2)
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments.
 
@@ -544,6 +590,9 @@ def parse_args() -> argparse.Namespace:
         prog="code-scanner",
         description="AI-driven code scanner for identifying issues in uncommitted changes",
     )
+    # Replace the default error handler with one that gives actionable hints
+    # for unrecognized-argument and invalid-choice errors.
+    parser.error = _clearer_error.__get__(parser, argparse.ArgumentParser)
 
     parser.add_argument(
         "projects",

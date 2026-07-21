@@ -210,31 +210,41 @@ You can configure Code Scanner to start automatically on login using macOS Launc
 
 - Code Scanner installed and working via command line
 - LLM backend (Ollama or LM Studio) installed
+- *(Optional)* **`gtimeout`** via `brew install coreutils` — used by the script's automated test launch. Stock macOS does not ship `timeout`; without `gtimeout` the test-launch step is skipped (the service is still installed). 
 
 ### Quick Setup
 
-Run the autostart script:
+Run the autostart script with `install` and pass the **full CLI command** (the same arguments you would pass to `code-scanner) as a single quoted string:
 
 ```bash
-./scripts/autostart-macos.sh
+./scripts/autostart-macos.sh install "/path/to/project -c /path/to/config.toml"
 ```
 
-The script will interactively guide you through:
+Multiple projects and modes are supported in one command:
 
-1. **Project path** - The directory to scan
-2. **Config file path** - Your `code_scanner_config.toml` location
-3. **Test launch** - Verifies the scanner works before registering
-4. **LaunchAgent registration** - Creates a login item
+```bash
+./scripts/autostart-macos.sh install "/path/to/project1 -c /path/to/config1.toml /path/to/project2 -c /path/to/config2.toml --mode branch"
+```
+
+The script will:
+
+1. **Reinstall from source** — rebuilds and reinstalls code-scanner from the project source (preferring pipx, falling back to `uv`/`pip`), so the service runs the latest version.
+2. **Verify CLI compatibility** — checks the installed binary supports every flag in your command and prints a clear diagnostic if the install is stale.
+3. **Test launch** the scanner to verify the command works (requires `gtimeout`/`timeout`).
+4. **Register the LaunchAgent** at `~/Library/LaunchAgents/com.code-scanner.plist`.
+
+Other commands: `./scripts/autostart-macos.sh remove` (uninstall) and `./scripts/autostart-macos.sh status`.
 
 ### What the Script Does
 
-1. **Detects legacy LaunchAgents** and offers to remove them
-2. **Validates paths** for project and config file
-3. **Test launches** the scanner to verify configuration
-4. **Creates wrapper script** at `~/.code-scanner/launch-wrapper.sh`
-5. **Creates LaunchAgent** at `~/Library/LaunchAgents/com.code-scanner.plist`
-6. **Loads the agent** to start on login
-7. **Includes 60-second delay** to allow LLM backend startup
+1. **Reinstalls** code-scanner from source (pipx/uv/pip)
+2. **Verifies** the installed binary supports all CLI flags used
+3. **Detects legacy LaunchAgents** and offers to remove them
+4. **Test launches** the scanner to verify configuration (requires `gtimeout`)
+5. **Creates wrapper script** at `~/.code-scanner/launch-wrapper.sh`
+6. **Creates LaunchAgent** at `~/Library/LaunchAgents/com.code-scanner.plist`
+7. **Loads the agent** to start on login
+8. **Includes 60-second delay** to allow LLM backend startup
 
 ### Managing the Service
 

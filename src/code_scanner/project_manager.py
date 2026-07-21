@@ -183,8 +183,8 @@ class ProjectManager:
 
             most_active_id = max(eligible_projects, key=project_activity.get)
             readable_activity = {pid: self._ns_to_datetime(ts) for pid, ts in project_activity.items()}
-            logger.info(f"Project activity comparison (filtered): {readable_activity}")
-            logger.info(f"Selected most active project: {most_active_id} (mtime={self._ns_to_datetime(project_activity[most_active_id])})")
+            logger.debug(f"Project activity comparison (filtered): {readable_activity}")
+            logger.debug(f"Selected most active project: {most_active_id} (mtime={self._ns_to_datetime(project_activity[most_active_id])})")
             return self._projects[most_active_id]
     
     def switch_to_project(self, project: Project, skip_cooldown: bool = False) -> None:

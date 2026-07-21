@@ -33,7 +33,7 @@ context_limit = 16384    # Context window size in tokens (minimum 16384 recommen
 pattern = "*.cpp, *.cc, *.cxx, *.hpp, *.h"
 checks = [
     # Memory management checks
-    "Check that stack allocation is preferred over heap allocation for small, short-lived objects.",
+    "Check that stack allocation is used instead of heap allocation everywhere where objects lifetime is predetermined",
     "Check that smart pointers (unique_ptr, shared_ptr) are used instead of raw pointers where appropriate.",
     "Check that RAII patterns are used instead of manual new/delete.",
 

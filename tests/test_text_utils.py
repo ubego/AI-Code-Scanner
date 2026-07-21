@@ -14,6 +14,7 @@ from code_scanner.text_utils import (
     format_validation_error,
     validate_file_path,
     validate_line_number,
+    code_snippet_still_present,
     MAX_OUTPUT_LINES,
     MAX_OUTPUT_BYTES,
 )
@@ -319,7 +320,61 @@ class TestSuggestSimilarFiles:
         """Test max_suggestions parameter."""
         for i in range(10):
             (tmp_path / f"file{i}.py").write_text("content")
-        
+
         suggestions = suggest_similar_files("file.py", tmp_path, max_suggestions=3)
-        
+
         assert len(suggestions) <= 3
+
+
+class TestCodeSnippetStillPresent:
+    """Tests for code_snippet_still_present presence check."""
+
+    def test_snippet_present_returns_true(self):
+        """Snippet embedded in larger file content returns True."""
+        snippet = "const userFunds = Math.floor(bonus + balance)"
+        file_content = (
+            "import QtQuick\n\n"
+            "Item {\n"
+            f"    {snippet}\n"
+            "    const other = 42\n"
+            "}\n"
+        )
+        assert code_snippet_still_present(snippet, file_content) is True
+
+    def test_snippet_absent_returns_false(self):
+        """Snippet removed from file content returns False (legitimate fix)."""
+        snippet = "const userFunds = Math.floor(bonus + balance)"
+        file_content = "import QtQuick\nItem {\n    const other = 42\n}\n"
+        assert code_snippet_still_present(snippet, file_content) is False
+
+    def test_empty_snippet_returns_none(self):
+        """Empty/whitespace snippet cannot be checked -> None."""
+        assert code_snippet_still_present("", "some content") is None
+        assert code_snippet_still_present("   \n  ", "some content") is None
+
+    def test_no_file_content_returns_none(self):
+        """Missing file content cannot be checked -> None."""
+        assert code_snippet_still_present("some code", None) is None
+        assert code_snippet_still_present("some code", "") is None
+
+    def test_whitespace_tolerant(self):
+        """Whitespace differences do not defeat the match."""
+        snippet = "const x = Math.floor(a + b)"
+        # Same code with different indentation and extra blank lines
+        file_content = "Item {\n\n\n    const   x   =   Math.floor(a+b)\n}\n"
+        assert code_snippet_still_present(snippet, file_content) is True
+
+    def test_multiline_snippet_present(self):
+        """Multi-line snippet (the userFunds case) is detected when present."""
+        snippet = (
+            "const userFunds = Math.floor(bonus + balance)\n"
+            "const userFundsForDisplay = Math.floor(bonus + balance)"
+        )
+        file_content = (
+            "Item {\n"
+            "    const userFunds = Math.floor(bonus + balance)\n"
+            "    const userFundsForDisplay = Math.floor(bonus + balance)\n"
+            "    Text { text: 'hello' }\n"
+            "}\n"
+        )
+        assert code_snippet_still_present(snippet, file_content) is True

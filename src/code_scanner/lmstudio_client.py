@@ -5,6 +5,7 @@ import logging
 from typing import Any, Optional
 
 from openai import OpenAI, APIConnectionError, APIError
+import httpx
 
 from .base_client import (
     BaseLLMClient, LLMClientError, ContextOverflowError, RequestBuilder,
@@ -223,7 +224,7 @@ class LMStudioClient(BaseLLMClient):
                     user_prompt=user_prompt,
                     tools=tools,
                     context_limit=self._context_limit,
-                    reasoning_effort="high",
+                    reasoning_effort="medium",
                     response_format=response_format,
                 )
                 request_params["stream"] = True
@@ -241,6 +242,14 @@ class LMStudioClient(BaseLLMClient):
 
                     content_delta = delta.content or ""
                     acc.feed(content_delta)
+
+                    # Capture reasoning/thinking tokens so a legitimate
+                    # reasoning phase is not misclassified as a stalled
+                    # stream (empty content deltas). Reasoning is NOT part
+                    # of the final JSON answer, so it is not accumulated.
+                    reasoning_delta = self._extract_reasoning(delta)
+                    if reasoning_delta:
+                        acc.feed_reasoning(reasoning_delta)
 
                     if delta.tool_calls:
                         for tc_delta in delta.tool_calls:
@@ -357,12 +366,56 @@ class LMStudioClient(BaseLLMClient):
                 logger.warning(f"API error (attempt {attempt + 1}): {e}")
                 continue
 
+            except httpx.TimeoutException as e:
+                logger.warning(
+                    f"LM Studio request timed out (attempt {attempt + 1}/{max_retries}). "
+                    f"The model took longer than the configured timeout to respond."
+                )
+                last_raw_response = f"Timeout: {e}"
+                continue
+            except httpx.HTTPError as e:
+                logger.warning(
+                    f"LM Studio HTTP error (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+                last_raw_response = f"HTTP error: {e}"
+                continue
+
         # Show the last raw response to help debug
         raw_preview = last_raw_response[:1000] if len(last_raw_response) > 1000 else last_raw_response
+        timeout_failed = isinstance(last_raw_response, str) and "Timeout" in last_raw_response
         raise LLMClientError(
-            f"Failed to get valid JSON response after {max_retries} attempts.\n"
+            f"{'LLM request timed out' if timeout_failed else 'Failed to get valid JSON response'} "
+            f"after {max_retries} attempts.\n"
             f"--- Last raw LLM response ---\n{raw_preview}\n--- End raw response ---"
         )
+
+    @staticmethod
+    def _extract_reasoning(delta: Any) -> str:
+        """Extract reasoning/thinking tokens from a streaming delta.
+
+        Different backends/model APIs expose reasoning under different field
+        names (``reasoning``, ``reasoning_content``, ``thinking``). This
+        inspects all known locations, including extra (non-schema) fields.
+
+        Args:
+            delta: A chat completion streaming ``delta`` object.
+
+        Returns:
+            The reasoning text for this chunk, or "" if none.
+        """
+        for attr in ("reasoning_content", "reasoning", "thinking"):
+            value = getattr(delta, attr, None)
+            if value:
+                return value
+        # Some SDKs/model APIs put reasoning into pydantic extra fields
+        extra = getattr(delta, "model_extra", None)
+        if isinstance(extra, dict):
+            for key in ("reasoning_content", "reasoning", "thinking"):
+                value = extra.get(key)
+                if value:
+                    return value
+        return ""
+
 
     def _try_fix_json_response(self, malformed_content: str) -> Optional[dict]:
         """Try to get LLM to fix its own malformed JSON response.

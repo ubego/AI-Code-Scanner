@@ -104,6 +104,18 @@ class StreamValidator:
 
         self._check_repetition()
 
+    def note_activity(self) -> None:
+        """Register non-content activity (e.g. reasoning/thinking tokens).
+
+        Reasoning models stream long stretches of thinking tokens where the
+        ``content`` field is empty. Without this, such a thinking phase is
+        misclassified as a stalled stream. Calling this resets the
+        consecutive-empty-chunk counter so a legitimate reasoning phase is
+        not aborted.
+        """
+        self._total_chunks += 1
+        self._empty_chunks = 0
+
     def _check_repetition(self) -> None:
         """Detect if the LLM is stuck in a content loop.
 

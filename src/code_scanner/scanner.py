@@ -30,6 +30,11 @@ from .ai_tools import AIToolExecutor, AI_TOOLS_SCHEMA
 
 logger = logging.getLogger(__name__)
 
+# Hardcoded fraction of the context window filled with file content per LLM
+# call. Lower = smaller batches = faster input prefill on weak GPUs (more
+# calls). Not user-configurable by design.
+DEFAULT_CONTEXT_USAGE_RATIO = 0.2
+
 
 class Scanner:
     """AI Scanner that executes checks against code changes."""
@@ -549,6 +554,11 @@ class Scanner:
                     continue  # Skip to next check
                 except LLMClientError as e:
                     error_msg = str(e).lower()
+                    # A genuine timeout means the model is too slow for this
+                    # check/batch. Rather than aborting the whole scan (which
+                    # discards all progress and restarts from check 1), skip
+                    # this single check and move on so the scan can advance.
+                    is_timeout = "timed out" in error_msg
                     # Check for any connection-related error (lost connection, connection refused, etc.)
                     is_connection_error = any(
                         phrase in error_msg for phrase in [
@@ -559,11 +569,22 @@ class Scanner:
                             "not connected",
                             "urlopen error",
                             "network",
-                            "timed out",
                         ]
                     )
-                    
-                    if is_connection_error:
+
+                    if is_timeout:
+                        logger.warning(f"LLM timed out on check, skipping to next check: {check[:50]}")
+                        skipped_key = "skipped_checks_timeout"
+                        if skipped_key not in self._scan_info:
+                            self._scan_info[skipped_key] = []
+                        self._scan_info[skipped_key].append({"check": check[:50]})
+                        # Count as processed so the run advances instead of stalling at 0
+                        self._scan_info["checks_run"] += 1
+                        self._update_status(
+                            ScanStatus.RUNNING, self._scan_info["checks_run"], total_checks, check
+                        )
+                        continue  # Skip to next check
+                    elif is_connection_error:
                         logger.warning(f"LLM connection error: {e}")
                         logger.info("Waiting for LLM connection to be restored...")
                         self._update_status(ScanStatus.CONNECTION_LOST, error_message=str(e))
@@ -629,9 +650,11 @@ class Scanner:
         if actually_changed_files:
             logger.debug(f"Files with changed content: {actually_changed_files[:10]}{'...' if len(actually_changed_files) > 10 else ''}")
 
-        # Update issue tracker with scan results - only for files that actually changed
+        # Update issue tracker with scan results - only for files that actually changed.
+        # Pass current file content so resolution is content-based: an issue whose
+        # code snippet is still present is kept OPEN even if the LLM didn't re-report it.
         new_count, resolved_count = self.issue_tracker.update_from_scan(
-            all_issues, actually_changed_files
+            all_issues, actually_changed_files, files_content=cached_files_content or {}
         )
         logger.info(f"Scan complete: {new_count} new issues, {resolved_count} resolved")
 
@@ -808,9 +831,11 @@ class Scanner:
         """
         context_limit = self.llm_client.context_limit
 
-        # Reserve tokens for prompt overhead, tool calling, and response
-        # Using 55% for file content leaves 45% for system prompt & tools
-        available_tokens = int(context_limit * 0.55)
+        # Reserve tokens for prompt overhead, tool calling, and response.
+        # Hardcoded ratio of the context window filled with file content per
+        # call. A smaller value yields smaller batches, which speeds up input
+        # prefill on weak GPUs at the cost of more calls.
+        available_tokens = int(context_limit * DEFAULT_CONTEXT_USAGE_RATIO)
         
         # Pre-compute token counts to avoid repeated estimation
         file_tokens = {path: estimate_tokens(content) for path, content in files_content.items()}
