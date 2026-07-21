@@ -279,7 +279,7 @@ You can configure Code Scanner to start automatically on login using Windows Tas
 
 ### Quick Setup
 
-Run the autostart script with `install` and pass the **full CLI command** (the same arguments you would pass to `code-scanner) as a single quoted string, from a Command Prompt in the code-scanner directory:
+Run the autostart script with `install` and pass the **full CLI command** (the same arguments you would pass to `code-scanner`) as a single quoted string, from a Command Prompt in the code-scanner directory:
 
 ```batch
 scripts\autostart-windows.bat install "C:\path\to\project -c C:\path\to\config.toml"

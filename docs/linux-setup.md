@@ -243,7 +243,7 @@ You can configure Code Scanner to start automatically on login using systemd use
 
 ### Quick Setup
 
-Run the autostart script with `install` and pass the **full CLI command** (the same arguments you would pass to `code-scanner) as a single quoted string:
+Run the autostart script with `install` and pass the **full CLI command** (the same arguments you would pass to `code-scanner`) as a single quoted string:
 
 ```bash
 ./scripts/autostart-linux.sh install "/path/to/project -c /path/to/config.toml"

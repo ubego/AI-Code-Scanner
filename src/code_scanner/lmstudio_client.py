@@ -224,7 +224,7 @@ class LMStudioClient(BaseLLMClient):
                     user_prompt=user_prompt,
                     tools=tools,
                     context_limit=self._context_limit,
-                    reasoning_effort="medium",
+                    reasoning_effort="high",
                     response_format=response_format,
                 )
                 request_params["stream"] = True

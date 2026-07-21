@@ -106,8 +106,12 @@ REM Verify the installed binary supports every long flag (--mode, --commit, ...)
 REM in the command. Uses PowerShell to scan --help output; emits a clear
 REM diagnostic if a flag is unsupported (stale install) instead of a confusing
 REM argparse error during test launch.
+REM CLI_ARGS is passed via the CLI_ARGS env var (read with $env:CLI_ARGS in
+REM PowerShell) instead of being interpolated into a single-quoted literal, so
+REM values containing apostrophes (e.g. C:\O'Brien\proj) stay literal and safe.
+set "CLI_ARGS=%CLI_ARGS%"
 powershell -NoProfile -Command ^
-  "$cmdArgs=' %CLI_ARGS% ';" ^
+  "$cmdArgs=' ' + ($env:CLI_ARGS) + ' ';" ^
   "$help = code-scanner --help 2>&1 | Out-String;" ^
   "$missing = @();" ^
   "foreach ($m in [regex]::Matches($cmdArgs, '--[a-z][a-z0-9-]*')) {" ^

@@ -329,7 +329,11 @@ class GitWatcher:
                 xy = parts[1]
                 path_portion = " ".join(parts[9:])
                 if "\t" in path_portion:
-                    path = path_portion.split("\t")[1]
+                    # porcelain-v2 rename entries are "<new_path>\t<orig_path>";
+                    # the new path is before the tab, the original after it.
+                    # Downstream stat/scan must use the new path (the original
+                    # no longer exists on disk).
+                    path = path_portion.split("\t")[0]
                 else:
                     path = path_portion
                 if path.startswith('"') and path.endswith('"'):

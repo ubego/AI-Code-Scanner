@@ -132,8 +132,15 @@ class LLMIssue(BaseModel):
         v = v.replace("\\", "/")
         while v.startswith("/"):
             v = v[1:]
+        # Strip parent-directory traversal sequences. The trailing bare ".."
+        # removal guarantees forward progress on inputs like "foo..py" or a
+        # bare "..", where "../" / "..\\" replacement alone would be a no-op
+        # and the loop would never terminate.
         while ".." in v:
-            v = v.replace("../", "").replace("..\\", "")
+            new_v = v.replace("../", "").replace("..\\", "")
+            if new_v == v:
+                new_v = new_v.replace("..", "")
+            v = new_v
         return v
 
     @field_validator("description", mode="after")
